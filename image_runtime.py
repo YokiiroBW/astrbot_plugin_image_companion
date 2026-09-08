@@ -11730,6 +11730,7 @@ Output:
     async def _generate_photo_image_legacy(
         self,
         *,
+        event: Any = None,
         workflow_kind: str,
         prompt_text: str,
         request_text: str = "",
@@ -13021,6 +13022,7 @@ Output:
                 workflow_kind=workflow_kind,
                 reference_image_path=reference_image_path,
                 image_size=image_size,
+                event=event,
             )
             if image_path:
                 return finish(
@@ -16185,6 +16187,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         workflow_kind: str = "text2img",
         reference_image_path: str = "",
         image_size: str = "",
+        event: Any = None,
     ) -> tuple[str, str]:
         handler = self._find_custom_photo_tool_handler()
         if handler is None:
@@ -16221,12 +16224,14 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     message_type=MessageType.FRIEND_MESSAGE,
                     session_id=str(session_key or "custom_tool"),
                 )
-            event = SyntheticPrivateWakeEvent(
-                context=self.context,
-                session=session,
-                message="",
-                sender_name="PrivateCompanion",
-            )
+            tool_event = event
+            if tool_event is None:
+                tool_event = SyntheticPrivateWakeEvent(
+                    context=self.context,
+                    session=session,
+                    message="",
+                    sender_name="PrivateCompanion",
+                )
         except Exception as exc:
             logger.warning("[PrivateCompanion] 构造自定义工具事件失败: %s", _single_line(exc, 160))
             return "", f"无法为函数工具构造事件上下文：{_single_line(exc, 120)}"
@@ -16240,10 +16245,10 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             list(kwargs.keys()),
         )
         try:
-            result = await handler(event, **kwargs)
+            result = await handler(tool_event, **kwargs)
         except TypeError:
             try:
-                result = await handler(event=event, **kwargs)
+                result = await handler(event=tool_event, **kwargs)
             except Exception as exc:
                 logger.warning("[PrivateCompanion] 自定义工具生图调用失败(keyword): %s", _single_line(exc, 200))
                 return "", f"函数工具调用失败：{_single_line(exc, 160)}"
@@ -16262,7 +16267,15 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 _single_line(parse_note, 120),
                 _single_line(result_text, 180),
             )
-            return image_path, f"ok ({_single_line(tool_name, 60)})"
+            tool_reported_delivery = bool(
+                re.search(
+                    r"(?<!未)(?:已|已经)\s*(?:成功)?\s*(?:发送|发出)|\b(?:sent|delivered)\b",
+                    result_text,
+                    flags=re.I,
+                )
+            )
+            delivery_marker = ";tool_delivery_confirmed" if tool_reported_delivery else ""
+            return image_path, f"ok ({_single_line(tool_name, 60)}){delivery_marker}"
         logger.info(
             "[PrivateCompanion] 自定义工具生图未解析到图片: tool=%s result_preview=%s",
             _single_line(tool_name, 80),
@@ -16341,6 +16354,16 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             if path.exists() and path.is_file():
                 size = path.stat().st_size
                 if size > 100:
+                    raw = await asyncio.to_thread(path.read_bytes)
+                    extension = self._external_image_extension_from_bytes(raw)
+                    if extension:
+                        archived = await self._save_external_generated_image(
+                            raw,
+                            session_key=session_key,
+                            ext=extension,
+                        )
+                        if archived:
+                            return archived, "本地文件已归档"
                     return str(path), "本地文件"
         except Exception:
             pass
