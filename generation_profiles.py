@@ -108,7 +108,7 @@ class LegacyPromptCompiler:
 
 class AnimaPromptCompiler:
     profile = "anima"
-    version = "1"
+    version = "2"
     quality = ("masterpiece", "best quality", "newest", "safe", "highres")
 
     @staticmethod
@@ -133,7 +133,7 @@ class AnimaPromptCompiler:
             *required,
         ]
         tag_block = _join([self._remove_nai_syntax(value) for value in positive_tags])
-        prose_values = [self._remove_nai_syntax(value) for value in _scene_phrases(spec)]
+        prose_values = [self._remove_nai_syntax(value) for value in (spec.user_request, *_scene_phrases(spec))]
         prose = ". ".join(value for value in prose_values if value)
         positive = f"{tag_block}. {prose}".strip(" .")
         negative_values = [

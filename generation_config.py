@@ -161,8 +161,10 @@ def build_route_registry(config: Mapping[str, Any]) -> tuple[RouteRegistry, Conf
             errors.append(f"route[{index}] has a missing or duplicate name")
             continue
         names.add(name)
-        if backend not in {"comfyui", "external", "legacy"}:
+        if backend not in {"comfyui", "external", "legacy", "anima_master"}:
             errors.append(f"route {name!r} has unsupported backend {backend!r}")
+        if backend == "anima_master" and workflow:
+            errors.append(f"route {name!r} must leave workflow empty; Anima Master owns its workflow configuration")
         if profile not in profiles:
             errors.append(f"route {name!r} has unknown model profile {profile!r}")
         if operation not in {"text2img", "selfie", "portrait", "edit"}:

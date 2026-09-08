@@ -157,7 +157,28 @@ def test_capability_status_and_execution_checks_share_availability_source() -> N
     assert status["backends"] == {
         "comfyui": False,
         "sdgen": False,
+        "anima_master": False,
         "external": True,
         "backup_external": False,
         "tool_call": False,
     }
+
+
+def test_anima_selection_reports_live_plugin_without_changing_auto_fallback() -> None:
+    runtime = _runtime()
+    runtime.photo_generation_backend = "anima_master"
+    runtime._external_image_api_endpoint_queue = lambda **kwargs: []
+    runtime._backup_external_unavailable_note = lambda: "disabled"
+    runtime.comfyui_text2img_workflow_name = ""
+    runtime.comfyui_selfie_workflow_name = ""
+    runtime._find_sdgen_plugin = lambda: None
+    runtime._find_custom_photo_tool_handler = lambda: None
+    plugin = SimpleNamespace(_generate_payload=lambda: None)
+    runtime.context = SimpleNamespace(get_registered_star=lambda name: SimpleNamespace(star_cls=plugin))
+    status = runtime.capability_status()
+    assert status["available"] and status["backends"]["anima_master"]
+    runtime.photo_generation_backend = "auto"
+    assert not runtime.capability_status()["available"]
+    runtime.photo_generation_backend = "anima_master"
+    runtime.context = None
+    assert not runtime.capability_status()["available"]

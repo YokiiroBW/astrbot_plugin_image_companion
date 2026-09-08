@@ -234,6 +234,7 @@ from .generation_policy import (
     hot_outfit_fields,
     resolve_structured_outfit,
 )
+from .anima_master_adapter import AnimaMasterAdapter, find_anima_master_plugin, reference_capacity
 from .generation_adapters import (
     ComfyUIServiceAdapter,
     GenerationMetrics,
@@ -12699,7 +12700,7 @@ Output:
             elapsed_ms = int((time.time() - started) * 1000)
             actual_submitted_prompt = (
                 local_backend_prompt_text
-                if backend in {"ComfyUI", "SDGen"}
+                if backend in {"ComfyUI", "SDGen", "Anima 绘图大师"}
                 else prompt_text
             )
             image_path = _path_text(image_path, 1000)
@@ -12949,6 +12950,32 @@ Output:
         if reference_image_path and not reference_exists:
             return finish("参考图", "", f"参考图路径不可用或文件不存在：{_single_line(reference_image_path, 160)}")
 
+        if preferred == "anima_master":
+            busy_state = self._local_photo_generation_busy_state(force_refresh=True)
+            if busy_state:
+                return finish("Anima 绘图大师", "", f"电脑高负荷，已延后 Anima 生图（{busy_state.get('reason') or '负载偏高'}）")
+            adapter = self._create_anima_master_adapter(session_key)
+            result = await adapter.execute(
+                local_backend_prompt_text,
+                negative_prompt=local_backend_negative_prompt_text,
+                operation=normalized_kind,
+                references=tuple(
+                    ReferenceBindingV1(reference_id=str(index), path=path, roles=("edit_source" if normalized_kind == "edit" else "identity",))
+                    for index, path in enumerate(reference_image_paths)
+                ),
+                image_size=image_size,
+                request_id=trace_id,
+            )
+            self._append_photo_generation_trace_event(
+                trace_id, "anima_master_result", status="ok" if result.ok else "error",
+                data={"task_id": result.task_id, "error_code": result.error_code, "degraded_capabilities": list(result.degraded_capabilities)},
+            )
+            return finish(
+                "Anima 绘图大师", result.image_path, result.note,
+                reference_submitted=bool(result.submitted_reference_ids),
+                generation_completed=result.generation_completed,
+                failure_stage=result.failure_stage,
+            )
         if preferred == "comfyui":
             if not self._comfyui_photo_available():
                 return finish("ComfyUI", "", "ComfyUI 后端不可用或未配置")
@@ -15345,6 +15372,8 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         ).lower()
         if preferred == "sdgen":
             return 0
+        if preferred == "anima_master":
+            return reference_capacity(find_anima_master_plugin(getattr(self, "context", None)))
         if preferred == "comfyui":
             return self._comfyui_photo_reference_capacity(
                 workflow_kind,
@@ -16026,6 +16055,28 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         except Exception as e:
             logger.warning(f"[PrivateCompanion] photo_text 生图失败: {e}", exc_info=True)
             return "", str(e)
+
+    def _create_anima_master_adapter(self, session_key: str) -> AnimaMasterAdapter:
+        def event_factory():
+            session = self._parse_message_session(session_key)
+            if session is None:
+                session = MessageSession(
+                    platform_name="private_companion", message_type=MessageType.FRIEND_MESSAGE,
+                    session_id=str(session_key or "anima_master"),
+                )
+            return SyntheticPrivateWakeEvent(context=self.context, session=session, message="")
+
+        async def materialize(path: str) -> str:
+            valid, _note = validate_output_image(path)
+            if not valid:
+                return ""
+            content = await asyncio.to_thread(Path(path).read_bytes)
+            extension = self._external_image_extension_from_bytes(content)
+            if not extension:
+                return ""
+            return await self._save_external_generated_image(content, session_key=session_key, ext=extension)
+
+        return AnimaMasterAdapter(find_anima_master_plugin(self.context), event_factory, materialize)
 
     def _find_sdgen_plugin(self) -> Any | None:
         try:
@@ -20039,6 +20090,8 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             return None
 
         adapters: dict[str, Any] = {}
+        if find_anima_master_plugin(getattr(self, "context", None)) is not None:
+            adapters["anima_master"] = self._create_anima_master_adapter(session_key)
         comfy_service = self._get_comfyui_public_service()
         if comfy_service is not None:
             async def materialize(url: str, _request_id: str) -> str:
@@ -23239,6 +23292,7 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
         backends = {
             "comfyui": comfyui,
             "sdgen": sdgen,
+            "anima_master": find_anima_master_plugin(getattr(self, "context", None)) is not None,
             "external": external,
             "backup_external": backup_external,
             "tool_call": tool_call,

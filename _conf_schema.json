@@ -85,7 +85,8 @@
         "description": "生图后端",
         "type": "string",
         "default": "auto",
-        "options": ["auto", "external", "comfyui", "sdgen", "tool_call"]
+        "options": ["auto", "external", "comfyui", "sdgen", "tool_call", "anima_master"],
+        "hint": "anima_master 直连已启用的 Anima 绘图大师，复用其 ComfyUI/模型配置；图片由陪伴插件统一发送。"
       },
       "external_image_api_platform": {
         "description": "在线图片平台",

@@ -2,6 +2,8 @@
 
 此插件为“我会永远陪着你”插件的拓展程序，请到其拓展页进行配置。
 
+0.3.7 新增 Anima 绘图大师（`astrbot_plugin_anima_master`）可选生图渠道，支持统一提示词、结果归档和实验性单图改图接入，并补充各类生图后端的安装与配置说明。
+
 0.3.6 汇合生图可靠性回归测试，覆盖参考图身份与服装约束、提示词冲突清理、负面提示词、生成元数据和调试文件行为。
 
 0.3.5 将 Image 运行层“自拍缺少身份参考图”从硬终止调整为提示词人物描述软降级，并记录 `identity_reference_fallback` 诊断事件；上层明确要求身份强一致性的业务仍可自行拦截。
@@ -38,6 +40,199 @@
 - 参考图库、生成归档和本地负载保护。
 
 在本插件中明确填写的配置优先于旧插件设置；未覆盖的项目继续读取兼容来源。外部生图后端不可用时，本插件会按配置顺序尝试回退，并将失败原因记录到排障信息中。
+
+## 各类生图接入方式
+
+所有配置都在陪伴插件的“陪伴面板 → 生图/模型”页面完成。先安装并启用本插件和
+`astrbot_plugin_private_companion`，再选择一种后端；本插件本身没有独立的生图命令入口。
+
+### 方式选择
+
+| 方式 | 适合场景 | 需要准备 | 参考图 |
+| --- | --- | --- | --- |
+| 在线图片 API | 不想维护本地 GPU，或使用云端模型 | 服务商 API 地址、Key、图片模型 ID | 取决于平台和模型 |
+| ComfyUI | 本地工作流、LoRA、ControlNet、可控改图 | 已运行的 AstrBot ComfyUI 和工作流 | 工作流声明 `images>=1` 时支持 |
+| Anima 绘图大师 | 已在使用 YayiMiko/anima-master | 已加载的 `astrbot_plugin_anima_master`，在该插件中配置 ComfyUI 和模型 | 开启其 `img2img_enabled` 后支持单图重绘 |
+| SDGen | 已经在使用 SDGen/Stable Diffusion WebUI | 已加载的 `astrbot_plugin_SDGen` 和可用 WebUI | 当前只按纯文生图接入 |
+| 函数工具 | 已有其他插件提供生图函数 | 工具注册名和参数名 | 工具声明并接收参考图参数时支持 |
+| 统一生图引擎 | 需要按模型档案、操作类型和回退路线管理 | `engine.mode=active` 及路线配置 | 由路线能力声明决定 |
+
+### 在线图片 API
+
+在“在线图片 API”中填写 `平台`、`API 地址`、`API Key`、`图片模型`。地址填写服务商的
+API 根地址即可，插件会补齐生成或编辑路径；也接受直接填写完整路径。超时建议设置为
+`180` 秒以上。结果可以是 URL 或 Base64，插件会自动下载/落盘并校验图片格式。
+
+平台和能力如下（模型 ID 以服务商控制台为准）：
+
+| 平台 | 平台值 | 地址/模型示例 | 参考图与协议 |
+| --- | --- | --- | --- |
+| OpenAI Images 兼容 | `openai` | `https://api.example.com/v1`；`gpt-image-1` | 文生图走 `/images/generations`；改图走 `/images/edits` multipart。能力取决于代理和模型 |
+| OpenRouter | `openrouter` | `https://openrouter.ai/api/v1`；填写可生成图片的模型 ID | 文生图兼容 Images；改图使用 JSON `input_references`，参考图会转为 data URL |
+| Agnes Image | `agnes` | `https://apihub.agnes-ai.com/v1`；如 `agnes-image-2.1-flash` | 支持文生图和参考图；可用 `ratio` 设置官方宽高比 |
+| SenseNova 日日新 | `sensenova` | 使用 SenseNova 控制台的 API 根地址；`sensenova-u1-fast` | 当前按纯文生图使用，参考图请切换其他后端 |
+| MiniMax | `minimax` | `https://api.minimaxi.com/v1` 或 `https://api.minimax.io/v1`；`image-01`/`image-01-live` | 统一调用 `/image_generation`；每次最多提交 1 张 PNG/JPEG 参考图 |
+| 阿里云百炼 | `bailian` | `https://dashscope.aliyuncs.com/api/v1`；`qwen-image`、`wan` 系列 | Qwen/Wan 优先使用多模态 `input.messages`；带参考图时不会回退为纯文生图 |
+| 魔搭社区 | `modelscope` | 使用魔搭 API 根地址；填写对应图片模型 | 使用异步任务和轮询；当前不接收参考图 |
+| 豆包/火山方舟 | `doubao` | 使用 Ark API 根地址（通常 `/api/v3`）；`seedream`/`doubao-seedream` | 调用图片生成接口；当前不接收参考图 |
+| Gemini | `gemini` | `https://generativelanguage.googleapis.com/v1beta`；支持图片输出的 Gemini 模型 | 调用 `models/{model}:generateContent`，支持文本和参考图；不适用于 Imagen 的 `:predict` 接口 |
+
+`平台`填 `auto` 时会根据地址和模型名自动识别。Agnes、SenseNova 等兼容值也可以直接写入
+端点配置，即使面板下拉列表未显示。模型必须是图片模型；把聊天模型填到这里通常会得到
+“模型不支持 images 接口”的错误。
+
+#### 多端点和回退
+
+需要多家服务商或多个 Key 时，使用 `external_image_api_endpoints` 队列，按数组顺序尝试，
+最多保留前 12 个端点。每项至少包含 `name`、`platform`、`base_url`、`api_key`、`model`，
+还可填写 `size`、`ratio`、`timeout_seconds`、`enabled` 和 `custom_headers`。例如：
+
+```json
+[
+  {
+    "name": "主端点",
+    "platform": "openai",
+    "base_url": "https://api.example.com/v1",
+    "api_key": "替换为你的 Key",
+    "model": "gpt-image-1",
+    "size": "1024x1024",
+    "timeout_seconds": 180,
+    "enabled": true
+  },
+  {
+    "name": "备用端点",
+    "platform": "gemini",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "api_key": "替换为你的 Key",
+    "model": "gemini-2.5-flash-image",
+    "enabled": true
+  }
+]
+```
+
+`custom_headers` 使用逐行的 `Header: value` 格式。普通端点队列会依次尝试启用的端点；
+统一引擎的付费后备路线另由路线上的 `allow_paid_fallback` 控制，该字段不是普通端点队列的开关。
+
+### ComfyUI 工作流
+
+1. 安装并启用 AstrBot ComfyUI，确认 ComfyUI 服务可连接。
+2. 在 ComfyUI 工作流管理中准备至少一个 `texts>=1、images=0、videos=0` 的文生图工作流。
+3. 自拍或改图另准备 `images>=1` 的工作流；工作流的图片输入数量决定最多能接收几张参考图。
+4. 在面板填写 `comfyui_text2img_workflow_name` 和 `comfyui_selfie_workflow_name`，名称必须与
+     ComfyUI 中的工作流名称完全一致。
+
+插件会自动读取工作流的文本/图片输入槽并轮询结果。带参考图时，如果找不到 `images>=1` 的
+匹配工作流，会停止提交，避免静默退化成不使用参考图的纯文生图。统一引擎无法确定槽位时，
+在 `engine.workflow_mappings` 中按工作流内容指纹提供经过验证的手动映射。
+
+### SDGen / Stable Diffusion WebUI
+
+安装并启用 `astrbot_plugin_SDGen`，让它连接到正在运行的 Stable Diffusion WebUI。插件会
+自动发现注册名为 `SDGen` 或 `astrbot_plugin_sdgen` 的实例，并调用其 `_call_t2i_api`；无需
+重复填写 WebUI 地址。SDGen 返回的第一张 `images` Base64 图片会被保存为 PNG，若启用了
+SDGen 自身的放大处理也会沿用该设置。当前路线只用于纯文生图；自拍、改图或需要参考图时，
+请使用 ComfyUI 或支持编辑接口的在线模型。
+
+### Anima 绘图大师（anima-master）
+
+已按 [YayiMiko/anima-master](https://github.com/YayiMiko/anima-master) **0.9.1** 的生成结果接口适配。
+它和 AstrBot ComfyUI 是两个不同的插件，接入绘图大师不需要再安装 `astrbot_plugin_comfyui`。
+
+1. 在 AstrBot 插件管理器安装上述仓库并启用，插件 ID 为 `astrbot_plugin_anima_master`。
+2. 在**绘图大师自己的配置页**填写 `comfyui_base_url`、`unet_name`、`clip_name`、`vae_name`。
+   模型名与 ComfyUI 下拉框一致；默认 `workflow=anima_t2i`，自定义工作流和千代模型/采样预设也由绘图大师管理。
+3. 使用其 `/anm 状态` 确认服务及模型可用，然后在**陪伴面板 → 生图后端**选择
+   **Anima 绘图大师（直连）**，配置值为 `anima_master`。不需要在线 API Key，也无需填写本插件的 ComfyUI 工作流名称。
+4. 普通接入保持 `engine.mode=legacy`，提示词格式使用 `traditional`，再发送 `陪伴 生图 一片蓝天下的花田` 或 `陪伴 自拍`。
+
+本插件配置片段：
+
+```json
+{
+  "engine": {"mode": "legacy"},
+  "image": {
+    "photo_generation_backend": "anima_master",
+    "photo_generation_prompt_format": "traditional"
+  }
+}
+```
+
+直连传递已整理的正面/负面提示词，复用绘图大师的默认宽高、采样步数、CFG、模型和工作流。
+本次请求指定的 `宽x高` 会传给绘图大师，并由其 `allowed_sizes` 校验；未指定时沿用其默认尺寸。
+提示词采用已准备模式，避免绘图大师再次优化时重置当前地点或服装；其提示词阶段的固定角色、
+质量词和画师/画风预设不会再次拼接，需要的标签可填写在陪伴的固定附加提示词中。
+
+**参考图与改图：**上游图生图仍是实验功能，默认关闭。需要时在绘图大师中开启
+`img2img_enabled`，然后带图发送或引用图片使用 `陪伴 改图`。一次实际提交 1 张原图，
+属于整图重绘，不能视为独立的身份/服装多图控制；重绘强度沿用 `edit_denoise`。
+改图尺寸由原图和 `max_image_side` 决定，负面词沿用上游工作流默认值，诊断会记录这两项降级。
+关闭该能力时，普通自拍可按人物描述生成，但缺少可提交原图的改图不会转成纯文生图。
+
+直连只读取不发消息的生成结果，将 `outputs` 中的第一张图片复制到本插件归档后交给陪伴发送。
+不要把它配置成 `tool_call + comfyui_generate`，该工具会由绘图大师自行发送，无法保证陪伴的投递顺序。
+无需修改绘图大师的 `send_result_to_chat`，其独立 `/anm` 指令仍照常工作。
+绘图大师的 `admin_only` 和 `allowed_sender_ids` 检查继续生效；陪伴桥接使用当前会话的合成事件，
+它不冒充管理员，也不保证群聊合成事件包含原始请求者身份。
+
+高级用户可将它加入统一路线表：
+
+```json
+{
+  "image": {"photo_generation_backend": "anima_master"},
+  "engine": {
+    "mode": "active",
+    "anima_scopes": ["text2img", "selfie", "portrait", "edit"],
+    "routes": [
+      {"name": "anima-text", "backend": "anima_master", "model_profile": "anima", "operation": "text2img", "timeout_seconds": 420},
+      {"name": "anima-selfie", "backend": "anima_master", "model_profile": "anima", "operation": "selfie", "timeout_seconds": 420}
+    ]
+  }
+}
+```
+
+每种操作单独建路线；`portrait`/`edit` 按同样结构添加，`edit` 仍要求上游图生图开关。
+该后端的 `workflow` 留空，工作流始终由绘图大师配置，`workflow_mappings` 不作用于它。
+`auto` 的原有后备顺序保持不变；需要 Anima 时显式选择此后端或配置统一引擎路线。
+
+常见失败可按记录区分：未发现插件时检查加载状态与版本；`not_permitted` 检查绘图大师权限；
+`comfyui_offline` 检查它的连接地址；`unsupported_size` 调整请求尺寸或 `allowed_sizes`；
+“已完成但图片归档失败”表示已经出图，应检查磁盘与文件读取，不要直接重复提交。
+
+### 自定义函数工具
+
+先让其他 AstrBot 插件注册一个可调用的 LLM 工具，再在面板填写：
+
+- `custom_photo_tool_name`：工具注册名；
+- `custom_photo_tool_prompt_param`：提示词参数名，默认 `prompt`；
+- `custom_photo_tool_kind_param`：可选的操作类型参数，会收到 `text2img`、`selfie`、`portrait` 或 `edit`；
+- `custom_photo_tool_reference_param`：可选的参考图路径参数。
+
+工具处理函数可接收 `(event, **kwargs)` 或 `(event=event, **kwargs)`。返回值需要包含图片路径、
+图片 URL、data URL 或 Base64；JSON 对象支持 `image_path`、`path`、`file_path`、`image_url`、
+`url`、`image_base64`、`base64`、`data` 等字段。选择了参考图却未配置参考图参数时，插件会
+停止调用并提示配置，避免生成结果丢失人物或服装一致性。
+
+### 统一生图引擎和 NAI
+
+需要分操作启用 ANIMA、NAI 或其他模型档案时，在 `engine.routes` 中为每个操作建立路线：
+`backend` 填 `comfyui`、`external` 或 `anima_master`，`model_profile` 填 `anima`、`nai`、`generic_natural`
+或 `generic_tags`，`operation` 填 `text2img`、`selfie`、`portrait`、`edit`，`workflow` 填
+工作流名称或在线端点名称。将 `engine.mode` 设为 `active` 才会真正提交；`shadow` 只编译和
+诊断，`legacy` 使用旧链路。
+
+NAI 路线只负责 NovelAI 标签和负面提示词编译。若使用 NovelAI 官方插件直连，保持官方直连
+配置即可；只有 `active` 且存在有效 `model_profile=nai` 路线时，统一引擎才会接管，其他情况
+不会重复提交。NAI 兼容代理应作为在线端点配置，并确认代理实际支持图片接口。
+
+### 参考图能力速查
+
+- 支持参考图：正确配置的 OpenAI 兼容编辑接口、OpenRouter、Agnes、MiniMax、Gemini，以及
+  声明 `images>=1` 的 ComfyUI 工作流。
+- 当前纯文生图：SenseNova U1 Fast、SDGen、魔搭社区、豆包/火山方舟。
+- 百炼的 Qwen/Wan 图片模型使用多模态协议；带参考图时必须保证模型和端点支持该协议。
+- Anima 绘图大师在开启实验性 `img2img_enabled` 后支持单张原图重绘。
+- 参考图库只负责提供素材，最终能提交几张图由所选后端的能力上限决定；超出上限时会保留主
+  参考图并把其余职责转成提示词。
 
 ## 统一生图引擎
 
