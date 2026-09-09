@@ -13050,7 +13050,15 @@ Output:
                 generation_completed=result.generation_completed,
                 failure_stage=result.failure_stage,
             )
-        if preferred == "comfyui" or (preferred == "auto" and self._native_comfyui_service() is not None):
+        native_comfyui = self._native_comfyui_service()
+        # An incomplete native configuration should remain a routing hint in
+        # auto mode. Let configured online/legacy backends continue instead of
+        # turning an optional connection into a hard failure.
+        if preferred == "comfyui" or (
+            preferred == "auto"
+            and native_comfyui is not None
+            and self._comfyui_photo_available()
+        ):
             if not self._comfyui_photo_available():
                 return finish("ComfyUI", "", "ComfyUI 后端不可用或未配置")
             busy_state = self._local_photo_generation_busy_state(force_refresh=True)
@@ -15944,6 +15952,30 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     "semantic_prompt_slots": semantic_prompt_slots or {},
                     "image_size": image_size or context.get("image_size", ""),
                 }, paths, call)
+                native_path = _path_text(outcome.get("image_path"), 1000)
+                if native_path and Path(native_path).is_file():
+                    # Reuse the shared archive writer so retention, size limits
+                    # and legacy data-directory migration apply to native
+                    # ComfyUI results as well.
+                    try:
+                        raw = await asyncio.to_thread(Path(native_path).read_bytes)
+                        archived = await self._save_external_generated_image(
+                            raw,
+                            session_key=session_key,
+                            ext=Path(native_path).suffix,
+                        )
+                        if archived:
+                            if Path(archived).resolve() != Path(native_path).resolve():
+                                try:
+                                    await asyncio.to_thread(Path(native_path).unlink)
+                                except OSError:
+                                    pass
+                            outcome = {**outcome, "image_path": archived}
+                    except Exception as exc:
+                        logger.info(
+                            "[ImageCompanion] ComfyUI 结果归档失败，保留直连路径: error_type=%s",
+                            type(exc).__name__,
+                        )
                 self._native_comfyui_last_result = outcome
                 return outcome["image_path"], "ok；ComfyUI 任务 " + outcome["task_id"]
             except asyncio.CancelledError:

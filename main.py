@@ -27,7 +27,7 @@ from .comfyui_workflows import WorkflowError
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.4.1"
+PLUGIN_VERSION = "0.4.2"
 PLUGIN_DISPLAY_NAME = "我会画给你看"
 STATUS_SCHEMA_VERSION = "image.status.v1"
 API_VERSION = "image.generation-api.v1"
@@ -306,7 +306,8 @@ class ImageCompanionExtensionAPI:
     async def test_comfyui_connection(self) -> dict[str, Any]:
         service = self._plugin.native_comfyui_service()
         if service is None:
-            raise WorkflowError("请先配置 ComfyUI 地址")
+            reason = str(getattr(self._plugin, "_native_comfyui_error", "") or "").strip()
+            raise WorkflowError(reason or "请先配置 ComfyUI 地址")
         return await service.test_connection()
 
     def import_comfyui_workflow(self, name: str, workflow: Any) -> dict[str, Any]:
@@ -505,15 +506,38 @@ class ImageCompanionPlugin(Star):
     def native_comfyui_service(self) -> ComfyUIService | None:
         config = getattr(self, "config", {}).get("comfyui", {})
         if not isinstance(config, dict) or not str(config.get("base_url") or "").strip():
+            self._native_comfyui = None
+            self._native_comfyui_config = None
+            self._native_comfyui_error = ""
             return None
-        key = json.dumps(config, sort_keys=True, ensure_ascii=False)
+        try:
+            key = json.dumps(config, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            self._native_comfyui = None
+            self._native_comfyui_config = "<invalid-config>"
+            self._native_comfyui_error = "ComfyUI 配置无法序列化"
+            logger.warning("[ImageCompanion] ComfyUI 配置无效: error_type=%s", type(exc).__name__)
+            return None
+        if key == getattr(self, "_native_comfyui_config", None):
+            return getattr(self, "_native_comfyui", None)
         if key != getattr(self, "_native_comfyui_config", None):
-            service = ComfyUIService(config, Path(self.data_dir))
+            try:
+                service = ComfyUIService(config, Path(self.data_dir))
+            except (ValueError, OSError, TypeError) as exc:
+                self._native_comfyui = None
+                self._native_comfyui_config = key
+                self._native_comfyui_error = str(exc)[:300] or "ComfyUI 配置无效"
+                logger.warning(
+                    "[ImageCompanion] ComfyUI 直连配置无效，将保留其他后端回退: error_type=%s",
+                    type(exc).__name__,
+                )
+                return None
             services = getattr(self, "_native_comfyui_services", [])
             services.append(service)
             self._native_comfyui_services = services
             self._native_comfyui = service
             self._native_comfyui_config = key
+            self._native_comfyui_error = ""
         return self._native_comfyui
 
     def comfyui_model_call(self, owner: Any = None):

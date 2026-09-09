@@ -24,7 +24,9 @@ class ComfyUIService:
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise WorkflowError("请填写有效的 ComfyUI HTTP 地址；鉴权请使用单独的密钥设置")
         self.store = WorkflowStore(Path(data_dir) / "comfyui_workflows", config.get("workflows", []))
-        self.output_dir = Path(data_dir) / "comfyui_outputs"
+        # Keep native outputs beside the legacy generated-photo archive so the
+        # existing retention and size limits cover every backend.
+        self.output_dir = Path(data_dir) / "generated_photos"
         self.client_id = "image-companion-" + uuid.uuid4().hex
         self._session: Any = None
         self._tasks: dict[str, str] = {}
@@ -111,10 +113,15 @@ class ComfyUIService:
                     declared = {**schema.get("required", {}), **schema.get("optional", {})}
                     inputs = {}
                     for key, value in node["inputs"].items():
-                        if any(s in key.lower() for s in ("key", "token", "secret", "password", "auth", "image")) and isinstance(value, str):
+                        key_text = str(key).lower()
+                        if any(s in key_text for s in ("key", "token", "secret", "password", "auth", "image", "base64")) and isinstance(value, str):
                             value = "[omitted]"
                         elif isinstance(value, str):
-                            value = value[:500]
+                            # Long values are commonly embedded images, URLs
+                            # or custom-node secrets. They are not useful for
+                            # mapping inference and must not enter the model
+                            # context merely because a field is misnamed.
+                            value = value[:500] if len(value) <= 2048 else "[omitted: long value]"
                         inputs[key] = {"value": value, "type": declared.get(key, [None])[0] if not isinstance(declared.get(key, [None])[0], list) else "COMBO"}
                     nodes[n] = {"class_type": node["class_type"], "title": str(node.get("_meta", {}).get("title", ""))[:150], "inputs": inputs,
                                 "output_node": definitions[node["class_type"]].get("output_node", False)}
@@ -157,19 +164,41 @@ class ComfyUIService:
         return {"status": "finished_or_unknown", "task_id": task_id}
 
     async def get_result(self, task_id: str) -> dict[str, Any]:
-        history = await self._request("GET", "/history/" + task_id)
+        task_id = str(task_id or "").strip()
+        if not task_id or len(task_id) > 256:
+            raise WorkflowError("ComfyUI 任务编号无效")
+        history = await self._request("GET", "/history/" + quote(task_id, safe=""))
         item = history.get(task_id)
         if not item:
             return {"status": "pending", "outputs": []}
-        status = item.get("status", {})
-        if status.get("status_str") == "error" or any(m[0] in {"execution_error", "execution_interrupted"} for m in status.get("messages", []) if m):
-            nodes = [str(m[1].get("node_id", "")) for m in status.get("messages", []) if len(m) > 1 and m[0] == "execution_error"]
+        status = item.get("status", {}) if isinstance(item, dict) else {}
+        status_name = str(status.get("status_str") or "").strip().lower() if isinstance(status, dict) else ""
+        messages = status.get("messages", []) if isinstance(status, dict) else []
+        messages = messages if isinstance(messages, list) else []
+        execution_errors = [
+            message for message in messages
+            if isinstance(message, (list, tuple))
+            and message
+            and message[0] in {"execution_error", "execution_interrupted"}
+        ]
+        if status_name in {"error", "failed", "cancelled", "interrupted"} or execution_errors:
+            nodes = [
+                str(message[1].get("node_id", ""))
+                for message in execution_errors
+                if len(message) > 1 and isinstance(message[1], dict) and message[0] == "execution_error"
+            ]
             return {"status": "failed", "error": "ComfyUI 执行失败，节点：" + ",".join(nodes), "outputs": []}
+        if status_name and status_name not in {"success", "completed"}:
+            return {"status": "pending", "task_id": task_id, "outputs": []}
         selected = self._tasks.get(task_id)
-        outputs = item.get("outputs", {})
+        outputs = item.get("outputs", {}) if isinstance(item, dict) else {}
+        outputs = outputs if isinstance(outputs, dict) else {}
         images = outputs.get(selected, {}).get("images", []) if selected else []
+        images = images if isinstance(images, list) else []
         result = []
         for entry in images:
+            if not isinstance(entry, dict):
+                continue
             query = urlencode({k: str(entry.get(k, "output" if k == "type" else "")) for k in ("filename", "subfolder", "type")})
             result.append({"kind": "images", "url": self.base_url + "/view?" + query})
         return {"status": "completed", "outputs": result}
@@ -204,8 +233,24 @@ class ComfyUIService:
             raise WorkflowError("ComfyUI 未返回支持的图片")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         path = self.output_dir / (uuid.uuid4().hex + suffix)
-        await asyncio.to_thread(path.write_bytes, data)
+        temporary = path.with_suffix(path.suffix + ".part")
+        try:
+            await asyncio.to_thread(temporary.write_bytes, data)
+            await asyncio.to_thread(temporary.replace, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
         return str(path)
+
+    async def _cancel_best_effort(self, task_id: str) -> None:
+        try:
+            await asyncio.wait_for(self.cancel(task_id), timeout=5)
+        except (Exception, asyncio.CancelledError):
+            # A timeout/cancellation must retain its original meaning even if
+            # ComfyUI is unavailable while the targeted delete is attempted.
+            return
 
     async def generate_image(self, workflow_id: str, request: Mapping[str, Any], references: list[str], call: ModelCall | None = None, *, mapping_override: Mapping[str, Any] | None = None, timeout_seconds: int | None = None) -> dict[str, Any]:
         # Analyze only on explicit request; generation uses stable saved rules.
@@ -274,20 +319,33 @@ class ComfyUIService:
         try:
             deadline = time.monotonic() + max(5, min(1800, int(timeout_seconds or self.config.get("timeout_seconds", 180))))
             while time.monotonic() < deadline:
-                result = await self.get_result(task_id)
+                remaining = deadline - time.monotonic()
+                try:
+                    result = await asyncio.wait_for(self.get_result(task_id), timeout=max(0.01, remaining))
+                except asyncio.TimeoutError:
+                    break
                 if result["status"] == "failed":
                     raise WorkflowError(result["error"])
                 if result["status"] == "completed":
                     if not result["outputs"]:
                         raise WorkflowError("工作流完成，但选定输出节点没有图片")
-                    path = await self.download(result["outputs"][0]["url"])
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        path = await asyncio.wait_for(
+                            self.download(result["outputs"][0]["url"]),
+                            timeout=max(0.01, remaining),
+                        )
+                    except asyncio.TimeoutError:
+                        break
                     return {"image_path": path, "task_id": task_id, "workflow": workflow_id, "fingerprint": stamp,
                             "dimensions": dimensions, "prompt_slots": {k: v for k, v in slots.items() if mapping["fields"][k]["kind"] == "prompt"}}
-                await asyncio.sleep(1)
-            await self.cancel(task_id)
+                await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
+            await self._cancel_best_effort(task_id)
             raise WorkflowError(f"等待 ComfyUI 超时，任务 {task_id} 可能仍在执行；未自动重新生成")
         except asyncio.CancelledError:
-            await self.cancel(task_id)
+            await self._cancel_best_effort(task_id)
             raise
         finally:
             self._tasks.pop(task_id, None)

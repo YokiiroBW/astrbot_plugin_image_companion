@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from pathlib import Path
@@ -102,6 +103,7 @@ async def test_rewriter_uses_rules_and_rejects_hallucinated_slots():
     slots, aspect = await rewrite_prompts(workflow, mapping, {"request_text": "双人合影", "api_key": "never-send"}, model)
     assert aspect == "landscape" and slots["positive_prompt"] == "two people"
     assert len(calls) == 1 and "never-send" not in calls[0] and "bad anatomy" in calls[0]
+    assert "<WORKFLOW_DATA>" in calls[0] and "</WORKFLOW_DATA>" in calls[0]
     async def invalid(prompt):
         return '{"slots":{"made_up":"oops"}}'
     with pytest.raises(WorkflowError, match="不一致"):
@@ -155,6 +157,7 @@ async def test_http_generation_submits_once_and_selects_final_image(tmp_path):
     try:
         result = await service.generate_image("test", {"request_text": "横图合影"}, [], model)
         assert Path(result["image_path"]).exists()
+        assert Path(result["image_path"]).parent.name == "generated_photos"
         assert result["task_id"] == "task-1" and result["dimensions"] == (1536, 1024)
         assert len(requests) == 1
         submitted = requests[0]["prompt"]
@@ -276,6 +279,28 @@ async def test_analysis_validates_and_saves_model_mapping(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_analysis_omits_long_custom_input_values(tmp_path):
+    workflow = graph()
+    workflow["8"] = {"class_type": "CustomNode", "inputs": {"payload": "x" * 3000}}
+    service = ComfyUIService({"base_url": "http://test.invalid", "workflows": [{"name": "test", "workflow": workflow}]}, tmp_path)
+    definitions = {
+        node["class_type"]: {"input": {"required": {key: ["STRING" if isinstance(value, str) else "INT"] for key, value in node["inputs"].items()}}, "output_node": node["class_type"] == "SaveImage"}
+        for node in workflow.values()
+    }
+    async def request(method, path, **kwargs):
+        return definitions
+    service._request = request
+    prompts = []
+    async def model(prompt):
+        prompts.append(prompt)
+        mapping = infer_mapping(graph())
+        return json.dumps(mapping)
+    await service.analyze("test", model, save=False)
+    assert "x" * 3000 not in prompts[0]
+    assert "[omitted: long value]" in prompts[0]
+
+
+@pytest.mark.asyncio
 async def test_bad_model_output_never_submits_and_execution_error_does_not_retry(tmp_path):
     service = ComfyUIService({"base_url": "http://test.invalid", "workflows": [{"name": "test", "workflow": graph()}]}, tmp_path)
     calls = []
@@ -294,6 +319,49 @@ async def test_bad_model_output_never_submits_and_execution_error_does_not_retry
         await service.generate_image("test", {"prompt_text": "a beach"}, [])
     assert calls.count(("POST", "/prompt")) == 1
     assert not service._tasks
+
+
+@pytest.mark.asyncio
+async def test_running_history_stays_pending_until_success(tmp_path):
+    service = ComfyUIService({"base_url": "http://test.invalid", "workflows": [{"name": "test", "workflow": graph()}]}, tmp_path)
+    service._tasks["task"] = "5"
+    service._request = lambda method, path, **kwargs: asyncio.sleep(
+        0,
+        result={"task": {"status": {"status_str": "running"}, "outputs": {}}},
+    )
+    result = await service.get_result("task")
+    assert result["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_poll_timeout_cancels_target_without_masking_timeout(tmp_path):
+    service = ComfyUIService({"base_url": "http://test.invalid", "workflows": [{"name": "test", "workflow": graph()}]}, tmp_path)
+    calls = []
+
+    async def request(method, path, **kwargs):
+        calls.append((method, path))
+        if path == "/prompt":
+            return {"prompt_id": "task"}
+        return {}
+
+    async def timed_out(_task_id):
+        raise asyncio.TimeoutError()
+
+    service._request = request
+    service.get_result = timed_out
+    with pytest.raises(WorkflowError, match="超时"):
+        await service.generate_image("test", {"prompt_text": "a beach"}, [], timeout_seconds=5)
+    assert calls == [("POST", "/prompt"), ("POST", "/queue")]
+    assert not service._tasks
+
+
+def test_invalid_native_config_degrades_without_breaking_other_backends(tmp_path):
+    plugin = ImageCompanionPlugin.__new__(ImageCompanionPlugin)
+    plugin.config = {"comfyui": {"base_url": "http://user:password@example.invalid"}}
+    plugin.data_dir = str(tmp_path)
+    plugin._native_comfyui_config = None
+    assert plugin.native_comfyui_service() is None
+    assert "有效" in plugin._native_comfyui_error
 
 
 @pytest.mark.asyncio
