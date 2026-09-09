@@ -7,9 +7,17 @@ from dataclasses import replace
 from typing import Protocol
 
 try:
-    from .generation_contracts import GenerationSpecV1, PromptPackageV1
+    from .generation_contracts import (
+        SEMANTIC_PROMPT_SLOT_NAMES,
+        GenerationSpecV1,
+        PromptPackageV1,
+    )
 except ImportError:  # pragma: no cover - standalone test/import fallback
-    from generation_contracts import GenerationSpecV1, PromptPackageV1
+    from generation_contracts import (
+        SEMANTIC_PROMPT_SLOT_NAMES,
+        GenerationSpecV1,
+        PromptPackageV1,
+    )
 
 
 def _join(values: tuple[str, ...] | list[str]) -> str:
@@ -60,6 +68,14 @@ def _scene_phrases(spec: GenerationSpecV1) -> list[str]:
     return [value for value in values if value]
 
 
+def _explicit_auxiliary_prompts(spec: GenerationSpecV1) -> dict[str, str]:
+    return {
+        str(name): str(value).strip()
+        for name, value in spec.auxiliary_prompts.items()
+        if str(name) in SEMANTIC_PROMPT_SLOT_NAMES and str(value).strip()
+    }
+
+
 class PromptCompiler(Protocol):
     profile: str
     version: str
@@ -100,6 +116,7 @@ class LegacyPromptCompiler:
         return PromptPackageV1(
             model_profile=self.profile,
             positive_prompt=positive,
+            auxiliary_prompts=_explicit_auxiliary_prompts(spec),
             required_concepts=spec.required_concepts,
             forbidden_concepts=spec.forbidden_concepts,
             compiler_version=self.version,
@@ -144,10 +161,38 @@ class AnimaPromptCompiler:
         negative = _join([self._remove_nai_syntax(value) for value in negative_values])
         if spec.operation in {"selfie", "portrait"}:
             negative = append_selfie_ui_negative(negative)
+        scene = spec.scene
+        pose_values = [
+            spec.composition.shot,
+            scene.current_activity,
+            *spec.composition.instructions,
+        ]
+        background_values = [
+            spec.composition.location or scene.location_text,
+            scene.time_phase.replace("_", " "),
+            scene.weather.condition,
+            spec.composition.lighting,
+        ]
+        extra_values = [
+            *self.quality,
+            "1girl" if spec.composition.subject_count == 1 else f"{spec.composition.subject_count}people",
+            spec.character.default_style or "anime illustration",
+            *appearance,
+            *required,
+        ]
+        auxiliary_prompts = {
+            "clothing_prompt": _join([self._remove_nai_syntax(value) for value in wardrobe]),
+            "pose_prompt": _join([self._remove_nai_syntax(value) for value in pose_values]),
+            "background_prompt": _join([self._remove_nai_syntax(value) for value in background_values]),
+            "extra_prompt": _join([self._remove_nai_syntax(value) for value in extra_values]),
+        }
+        auxiliary_prompts = {name: value for name, value in auxiliary_prompts.items() if value}
+        auxiliary_prompts.update(_explicit_auxiliary_prompts(spec))
         return PromptPackageV1(
             model_profile=self.profile,
             positive_prompt=positive,
             negative_prompt=negative,
+            auxiliary_prompts=auxiliary_prompts,
             required_concepts=tuple(dict.fromkeys((*spec.required_concepts, *spec.wardrobe.required))),
             forbidden_concepts=tuple(dict.fromkeys((*spec.forbidden_concepts, *spec.wardrobe.forbidden))),
             compiler_version=self.version,
@@ -176,6 +221,7 @@ class NaiPromptCompiler:
             model_profile=self.profile,
             positive_prompt=positive,
             negative_prompt=negative,
+            auxiliary_prompts=_explicit_auxiliary_prompts(spec),
             required_concepts=spec.required_concepts,
             forbidden_concepts=spec.forbidden_concepts,
             compiler_version=self.version,
@@ -198,6 +244,7 @@ class GenericNaturalPromptCompiler:
             model_profile=self.profile,
             positive_prompt=" ".join(part for part in parts if part).strip(),
             negative_prompt=negative,
+            auxiliary_prompts=_explicit_auxiliary_prompts(spec),
             required_concepts=spec.required_concepts,
             forbidden_concepts=spec.forbidden_concepts,
             compiler_version=self.version,

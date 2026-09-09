@@ -13,6 +13,9 @@ from typing import Any, Iterable, Mapping
 
 
 SCHEMA_VERSION = 1
+SEMANTIC_PROMPT_SLOT_NAMES = frozenset(
+    {"clothing_prompt", "pose_prompt", "background_prompt", "extra_prompt"}
+)
 
 
 class ContractValidationError(ValueError):
@@ -25,6 +28,19 @@ def _text(value: Any, limit: int = 1000) -> str:
 
 def _tuple_text(values: Iterable[Any] | None, limit: int = 300) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_text(value, limit) for value in (values or ()) if _text(value, limit)))
+
+
+def _validate_auxiliary_prompts(value: Mapping[str, str]) -> None:
+    if not isinstance(value, Mapping):
+        raise ContractValidationError("auxiliary_prompts must be a mapping")
+    for raw_name, raw_prompt in value.items():
+        name = str(raw_name or "").strip()
+        if name not in SEMANTIC_PROMPT_SLOT_NAMES:
+            raise ContractValidationError(f"unsupported auxiliary prompt slot: {name or '<empty>'}")
+        if not isinstance(raw_prompt, str):
+            raise ContractValidationError(f"auxiliary prompt {name!r} must be text")
+        if len(raw_prompt) > 4000:
+            raise ContractValidationError(f"auxiliary prompt {name!r} exceeds 4000 characters")
 
 
 def _optional_float(value: Any) -> float | None:
@@ -333,6 +349,7 @@ class GenerationSpecV1:
     required_concepts: tuple[str, ...] = ()
     forbidden_concepts: tuple[str, ...] = ()
     legacy_prompt: str = ""
+    auxiliary_prompts: Mapping[str, str] = field(default_factory=dict)
 
     def validate(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -344,6 +361,7 @@ class GenerationSpecV1:
         self.scene.validate()
         for reference in self.references:
             reference.validate()
+        _validate_auxiliary_prompts(self.auxiliary_prompts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +381,7 @@ class PromptPackageV1:
             raise ContractValidationError("unsupported prompt package version")
         if not self.model_profile or not self.positive_prompt:
             raise ContractValidationError("model_profile and positive_prompt are required")
+        _validate_auxiliary_prompts(self.auxiliary_prompts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,5 +475,5 @@ def contract_dict(value: Any) -> dict[str, Any]:
 
 __all__ = [name for name in globals() if name.endswith(("V1", "V2"))] + [
     "SCHEMA_VERSION", "ContractValidationError", "contract_dict",
-    "thermal_level_for_temperature", "REFERENCE_ROLES",
+    "thermal_level_for_temperature", "REFERENCE_ROLES", "SEMANTIC_PROMPT_SLOT_NAMES",
 ]

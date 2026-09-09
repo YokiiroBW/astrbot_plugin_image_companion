@@ -1,0 +1,5 @@
+pytest>=8,<10
+pytest-asyncio>=1,<2
+aiohttp>=3.10,<4
+Pillow>=10,<13
+PyYAML>=6,<7

@@ -2,6 +2,11 @@
 
 此插件为“我会永远陪着你”插件的拓展程序，请到其拓展页进行配置。
 
+0.4.1 区分提示词模型限流、超时、鉴权与其他调用错误，保留明确失败阶段，避免将模型故障误报为 ComfyUI 连接失败。
+
+0.4.0 内置 ComfyUI 连接、工作流节点识别、独立模型提示词重写和分槽、横竖画幅选择。补齐语义槽在新旧生成链路中的传递；不增加图片审查或自动重画。
+
+
 0.3.8 改进自定义 `tool_call` 生图接入：透传真实会话、归档短生命周期图片，并兼容工具自行投递图片的返回协议。
 
 0.3.7 新增 Anima 绘图大师（`astrbot_plugin_anima_master`）可选生图渠道，支持统一提示词、结果归档和实验性单图改图接入，并补充各类生图后端的安装与配置说明。
@@ -19,6 +24,68 @@
 `astrbot_plugin_image_companion` 是“我会永远陪着你”的图像生成扩展，提供统一的生成执行、后端管理和图片素材管理能力。
 
 插件支持文生图、自拍与人像生成、参考图改图、参考图库、提示词与负面提示词处理，以及 ComfyUI、SDGen 和在线图片 API 等后端。它也负责生成任务的回退、状态记录和归档管理。
+
+## ComfyUI 独立连接
+
+在本插件配置的 **ComfyUI 独立连接与工作流适配** 中填写：
+
+1. **ComfyUI 地址**：如 `http://127.0.0.1:8188`（同机部署示例；跨机器请填写生图机器地址）。这是生图机器地址，不是 AstrBot 面板地址。
+2. **API 工作流文件**：每项填写 AstrBot 所在机器能够读取的 API 格式 JSON 文件路径。迁移时可直接引用旧插件的 API 工作流文件，仅作为文件来源，不需要加载中间插件。也可以将文件放进本扩展数据目录的 `comfyui_workflows` 文件夹，再直接使用文件名。
+3. **默认文生图／自拍工作流**：填写完整文件名或列表中唯一的短名称，例如 `portrait`。
+4. **提示词处理模型**：从已配置模型中选择。它专门处理工作流分析和提示词重写，可与聊天模型不同；生成时留空则复用陪伴的生图提示词模型。
+5. **画幅选择**：`auto` 根据请求及重写模型建议选择；`workflow` 保留工作流尺寸；也可固定横图、竖图、方图。用户明确给出的尺寸优先，带参考图的自动模式默认保留工作流尺寸。为目标工作流设置合适的横竖尺寸、步长和像素上限。
+
+生图后端选择 `comfyui`。填写直连地址后，默认旧链路也会直接使用内置服务，无需开启高级统一引擎；地址留空时维持原有中间插件兼容链路。这里的“独立”指不依赖 ComfyUI 中间插件，仍由陪伴主插件提供生成请求和最终投递。
+
+管理员可以使用以下命令，无需启动额外网页或服务：
+
+```text
+画图工作流 连接
+画图工作流 列表
+画图工作流 识别 portrait
+画图工作流 分析 portrait
+```
+
+`识别` 使用节点与连线规则，`分析` 额外调用所选模型理解各输入的含义；通过字段校验后保存填写规则，并返回映射结果。工作流改变后需要重新识别。多个输出或无法确定的输入不会被猜测为成功，可使用模型分析或手工映射明确选择。
+
+每次生成只调用一次提示词重写模型，按保存的规则填写标签、自然语言或多语义槽。已有编码器的非空文本默认追加，避免丢失固定提示词；明确的动态字符串入口使用替换。ANIMA 语义槽写入服装、姿态、背景和补充内容，保留工作流固定画师、质量词、模型与 LoRA。负面词默认追加到原工作流负面词。关闭重写时保留现有提示词及分槽规则。
+
+工作流配置也支持 JSON 字符串对象（或配置文件中的对象），用于内嵌 API 工作流和手动填写规则：
+
+```json
+{
+  "name": "portrait",
+  "path": "/path/to/portrait-api.json",
+  "mapping": {
+    "fields": {
+      "positive_prompt": {"node_id": "6", "input_name": "text", "kind": "prompt", "mode": "append", "description": "人物与画面描述", "format": "natural"},
+      "negative_prompt": {"node_id": "7", "input_name": "text", "kind": "prompt", "mode": "append"},
+      "width": {"node_id": "5", "input_name": "width", "kind": "number", "mode": "replace"},
+      "height": {"node_id": "5", "input_name": "height", "kind": "number", "mode": "replace"}
+    },
+    "output_node": "9"
+  }
+}
+```
+
+示例节点编号仅演示格式，必须替换成实际工作流节点。`path` 也可替换成 `workflow` 节点字典。提示词支持 `append`、`replace`、`preserve`；不同阶段可使用不同槽名和描述。模型只填写已保存的文本槽，不修改工作流结构或任意采样参数。普通画布 JSON 暂不自动转换，请在 ComfyUI 导出 API 格式。
+
+标准 `LoadImage` 输入会先上传图片再填写返回文件名，`ETN_LoadImageBase64` 使用 Base64；参考图仍来自现有陪伴／图片扩展素材链路。工作流没有图片输入时不会假装使用参考图。超时不会自动重提；只撤销尚在排队的本插件任务，已开始的任务可能仍在 ComfyUI 执行，不发送全局中断。
+
+插件向宿主暴露 `test_comfyui_connection`、`import_comfyui_workflow`、`analyze_comfyui_workflow`，并沿用工作流列表、检查和映射校验接口。目前管理操作可通过上述命令完成，未增加陪伴面板专用按钮。
+
+## 开发验证
+
+使用 Python 3.12 或以上版本：
+
+```text
+python -m venv .venv
+.venv/Scripts/python -m pip install -r requirements-dev.txt
+.venv/Scripts/python -m pytest -q
+```
+
+测试沿用仓库的 AstrBot 边界替身，无需启动完整 AstrBot；HTTP 集成测试使用本机临时服务，不调用真实模型或 GPU。
+
 
 ## 与陪伴插件协同
 
@@ -53,7 +120,7 @@
 | 方式 | 适合场景 | 需要准备 | 参考图 |
 | --- | --- | --- | --- |
 | 在线图片 API | 不想维护本地 GPU，或使用云端模型 | 服务商 API 地址、Key、图片模型 ID | 取决于平台和模型 |
-| ComfyUI | 本地工作流、LoRA、ControlNet、可控改图 | 已运行的 AstrBot ComfyUI 和工作流 | 工作流声明 `images>=1` 时支持 |
+| ComfyUI | 本地工作流、提示词分槽、可控改图 | 可连接的 ComfyUI 服务与 API 工作流；也兼容旧中间插件 | 工作流包含有效图片输入时支持 |
 | Anima 绘图大师 | 已在使用 YayiMiko/anima-master | 已加载的 `astrbot_plugin_anima_master`，在该插件中配置 ComfyUI 和模型 | 开启其 `img2img_enabled` 后支持单图重绘 |
 | SDGen | 已经在使用 SDGen/Stable Diffusion WebUI | 已加载的 `astrbot_plugin_SDGen` 和可用 WebUI | 当前只按纯文生图接入 |
 | 函数工具 | 已有其他插件提供生图函数 | 工具注册名和参数名 | 工具声明并接收参考图参数时支持 |
@@ -115,7 +182,9 @@ API 根地址即可，插件会补齐生成或编辑路径；也接受直接填�
 `custom_headers` 使用逐行的 `Header: value` 格式。普通端点队列会依次尝试启用的端点；
 统一引擎的付费后备路线另由路线上的 `allow_paid_fallback` 控制，该字段不是普通端点队列的开关。
 
-### ComfyUI 工作流
+### ComfyUI 工作流（兼容旧中间插件）
+
+新部署可优先使用上方的“ComfyUI 独立连接”。以下方式用于继续复用旧中间插件。
 
 1. 安装并启用 AstrBot ComfyUI，确认 ComfyUI 服务可连接。
 2. 在 ComfyUI 工作流管理中准备至少一个 `texts>=1、images=0、videos=0` 的文生图工作流。

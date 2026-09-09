@@ -189,6 +189,7 @@ def route_cache_key(
         "required_concepts": spec.required_concepts,
         "forbidden_concepts": spec.forbidden_concepts,
         "legacy_prompt": spec.legacy_prompt,
+        "auxiliary_prompts": dict(spec.auxiliary_prompts),
         "route": route.key.value(),
         "workflow_fingerprint": workflow_fingerprint,
         "mapping_version": mapping_version,

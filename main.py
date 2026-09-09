@@ -16,15 +16,18 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.event import AstrMessageEvent, filter
 
 from .helpers import _set_into_config
 from .image_runtime import ImageGenerationRuntime, _IMAGE_SETTING_UNSET
 from .generation_config import active_engine_claims_profile, route_diagnostics
 from .photo_reference_catalog import CATALOG_VERSION, load_catalog, validate_and_serialize
+from .comfyui_service import ComfyUIService
+from .comfyui_workflows import WorkflowError
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.3.8"
+PLUGIN_VERSION = "0.4.1"
 PLUGIN_DISPLAY_NAME = "我会画给你看"
 STATUS_SCHEMA_VERSION = "image.status.v1"
 API_VERSION = "image.generation-api.v1"
@@ -211,6 +214,14 @@ class ImageCompanionExtensionAPI:
         backend = str(outcome.get("backend") or "").strip().lower()
         note = str(outcome.get("note") or "").strip().lower()
         text = f"{backend} {note}"
+        if "提示词模型" in note:
+            if "429" in note:
+                return "prompt_model_rate_limited", "prompt_rewrite"
+            if "超时" in note:
+                return "prompt_model_timeout", "prompt_rewrite"
+            if "鉴权失败" in note:
+                return "prompt_model_auth_failed", "prompt_rewrite"
+            return "prompt_model_failed", "prompt_rewrite"
         if any(marker in text for marker in ("参考图", "reference")):
             return "reference_unavailable", "reference"
         if any(marker in text for marker in ("未配置", "不可用", "disabled", "unavailable")):
@@ -242,7 +253,7 @@ class ImageCompanionExtensionAPI:
             raw = Path(image_path).read_bytes()
             _suffix, media_type = self._image_content_type(raw)
             media_type = media_type or "image/jpeg"
-            return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "succeeded", "backend": "comfyui" if str(outcome.get("backend") or "").lower() == "comfyui" else "external", "backend_task_id": request_id, "output": {"asset_id": "image_" + request_id[:32], "kind": "image", "media_type": media_type, "local_path": image_path, "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, "error": None, "degraded_capabilities": []}
+            return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "succeeded", "backend": "comfyui" if str(outcome.get("backend") or "").lower() == "comfyui" else "external", "backend_task_id": str((outcome.get("metadata") or {}).get("task_id") or request_id), "output": {"asset_id": "image_" + request_id[:32], "kind": "image", "media_type": media_type, "local_path": image_path, "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, "error": None, "degraded_capabilities": []}
         error_code, error_stage = self._generation_failure_code(outcome)
         return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "failed", "backend": "", "backend_task_id": "", "output": None, "error": {"code": error_code, "stage": error_stage}, "degraded_capabilities": []}
 
@@ -291,6 +302,25 @@ class ImageCompanionExtensionAPI:
     def list_comfyui_workflows(self, owner: Any) -> list[dict[str, Any]]:
         """Return structured workflow capabilities for an advanced settings UI."""
         return self._comfyui_service(owner).list_workflows()
+
+    async def test_comfyui_connection(self) -> dict[str, Any]:
+        service = self._plugin.native_comfyui_service()
+        if service is None:
+            raise WorkflowError("请先配置 ComfyUI 地址")
+        return await service.test_connection()
+
+    def import_comfyui_workflow(self, name: str, workflow: Any) -> dict[str, Any]:
+        service = self._plugin.native_comfyui_service()
+        if service is None:
+            raise WorkflowError("请先配置 ComfyUI 地址")
+        return {"id": service.store.import_workflow(name, workflow)}
+
+    async def analyze_comfyui_workflow(self, owner: Any, workflow_id: str, *, use_model: bool = False, save: bool = True) -> dict[str, Any]:
+        service = self._plugin.native_comfyui_service()
+        if service is None:
+            raise WorkflowError("请先配置 ComfyUI 地址")
+        call = self._plugin.comfyui_model_call(owner) if use_model else None
+        return await service.analyze(workflow_id, call, save=save)
 
     def inspect_comfyui_workflow(self, owner: Any, workflow_id: str) -> dict[str, Any]:
         return self._comfyui_service(owner).inspect_workflow(workflow_id)
@@ -403,6 +433,9 @@ class ImageCompanionExtensionAPI:
             image_path=image_path,
             session_key=str((request or {}).get("session_key") or ""),
         )
+        native_result = getattr(runtime, "_native_comfyui_last_result", None)
+        if isinstance(native_result, dict):
+            metadata.update({key: native_result[key] for key in ("task_id", "workflow", "fingerprint", "dimensions") if key in native_result})
         await self._plugin.persist_image_state()
         return {
             "handled": True,
@@ -469,6 +502,75 @@ class ImageCompanionPlugin(Star):
         else:
             logger.info("[ImageCompanion] 已接入陪伴主插件，页面与运行入口由陪伴面板统一管理")
 
+    def native_comfyui_service(self) -> ComfyUIService | None:
+        config = getattr(self, "config", {}).get("comfyui", {})
+        if not isinstance(config, dict) or not str(config.get("base_url") or "").strip():
+            return None
+        key = json.dumps(config, sort_keys=True, ensure_ascii=False)
+        if key != getattr(self, "_native_comfyui_config", None):
+            service = ComfyUIService(config, Path(self.data_dir))
+            services = getattr(self, "_native_comfyui_services", [])
+            services.append(service)
+            self._native_comfyui_services = services
+            self._native_comfyui = service
+            self._native_comfyui_config = key
+        return self._native_comfyui
+
+    def comfyui_model_call(self, owner: Any = None):
+        config = self.config.get("comfyui", {})
+        provider_id = str(config.get("prompt_provider_id") or getattr(owner, "photo_prompt_provider_id", "") or "").strip()
+        if not provider_id:
+            raise WorkflowError("请在 ComfyUI 设置中选择提示词处理模型")
+
+        async def call(prompt: str) -> str:
+            timeout = max(10, min(180, int(config.get("model_timeout_seconds", 60))))
+            try:
+                response = await asyncio.wait_for(
+                    self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt,
+                                              system_prompt="仅按要求处理生图工作流数据，返回 JSON，不调用工具。",
+                                              contexts=[], max_tokens=4096),
+                    timeout=timeout,
+                )
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError as exc:
+                raise WorkflowError(f"提示词模型 {provider_id} 调用超时（等待超过 {timeout} 秒），尚未向 ComfyUI 提交生图") from exc
+            except Exception as exc:
+                status = getattr(exc, "status_code", None)
+                if status is None:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 429:
+                    reason = "请求或额度受限（HTTP 429），请稍后再试或更换提示词处理模型"
+                elif status in {401, 403}:
+                    reason = f"鉴权失败（HTTP {status}），请检查模型访问权限"
+                else:
+                    reason = f"调用失败（HTTP {status}）" if status else f"调用失败（{type(exc).__name__}）"
+                raise WorkflowError(f"提示词模型 {provider_id} {reason}；尚未向 ComfyUI 提交生图") from exc
+            return str(getattr(response, "completion_text", "") or "")
+        return call
+
+    @filter.command("画图工作流")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def comfyui_workflow_command(self, event: AstrMessageEvent, action: str = "列表", name: str = ""):
+        """Manage the native workflow connection without a separate web server."""
+        try:
+            service = self.native_comfyui_service()
+            if service is None:
+                yield event.plain("请先在本插件 ComfyUI 设置中填写地址。")
+                return
+            if action == "连接":
+                result = await service.test_connection()
+            elif action in {"识别", "分析"}:
+                result = await service.analyze(name, self.comfyui_model_call() if action == "分析" else None)
+            elif action == "列表":
+                result = {"workflows": service.store.names()}
+            else:
+                yield event.plain("用法：画图工作流 连接／列表／识别 工作流名／分析 工作流名。分析使用配置的提示词模型。")
+                return
+            yield event.plain(json.dumps(result, ensure_ascii=False, indent=2))
+        except (ValueError, OSError, TimeoutError) as exc:
+            yield event.plain(str(exc) or "ComfyUI 操作超时")
+
     def _private_companion_api(self) -> Any | None:
         module_names = (
             "data.plugins.astrbot_plugin_private_companion.main",
@@ -529,6 +631,10 @@ class ImageCompanionPlugin(Star):
         lets AstrBot users move one setting at a time and preserves every
         existing backend contract during the transition.
         """
+        native = self.config.get("comfyui", {})
+        native_names = {"comfyui_text2img_workflow_name": "text2img_workflow", "comfyui_selfie_workflow_name": "selfie_workflow"}
+        if isinstance(native, dict) and native.get("base_url") and name in native_names and native.get(native_names[name]):
+            return native[native_names[name]]
         image_config = self.config.get("image")
         if isinstance(image_config, dict) and name in image_config:
             value = image_config.get(name)
@@ -796,5 +902,7 @@ class ImageCompanionPlugin(Star):
     async def terminate(self) -> None:
         global _active_plugin
         await self.persist_image_state()
+        for service in getattr(self, "_native_comfyui_services", []):
+            await service.close()
         if _active_plugin is self:
             _active_plugin = None

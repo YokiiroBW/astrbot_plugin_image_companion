@@ -21,10 +21,18 @@ _DEBUG_BINDING: ContextVar[tuple[Any, str] | None] = ContextVar(
 )
 
 try:
-    from .generation_contracts import BackendCapabilitiesV1, GenerationResultV1
+    from .generation_contracts import (
+        SEMANTIC_PROMPT_SLOT_NAMES,
+        BackendCapabilitiesV1,
+        GenerationResultV1,
+    )
     from .generation_engine import ReferencePlan, RouteDefinition
 except ImportError:  # pragma: no cover
-    from generation_contracts import BackendCapabilitiesV1, GenerationResultV1
+    from generation_contracts import (
+        SEMANTIC_PROMPT_SLOT_NAMES,
+        BackendCapabilitiesV1,
+        GenerationResultV1,
+    )
     from generation_engine import ReferencePlan, RouteDefinition
 
 
@@ -100,6 +108,52 @@ def endpoint_model_profile(endpoint: Mapping[str, Any]) -> str:
     return "generic_natural"
 
 
+def normalize_semantic_prompt_slots(value: Any) -> dict[str, str]:
+    """Return the fixed, non-empty semantic prompt subset accepted by ComfyUI."""
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(name).strip(): prompt.strip()
+        for name, prompt in value.items()
+        if str(name).strip() in SEMANTIC_PROMPT_SLOT_NAMES
+        and isinstance(prompt, str)
+        and prompt.strip()
+    }
+
+
+def prepare_legacy_semantic_workflow(
+    service: Any,
+    workflow_id: str,
+    semantic_prompts: Any,
+) -> tuple[dict[str, Any] | None, tuple[str, ...], tuple[str, ...]]:
+    """Prepare an in-memory workflow copy while leaving legacy execution intact."""
+    requested = normalize_semantic_prompt_slots(semantic_prompts)
+    requested_names = tuple(sorted(requested))
+    if service is None or not requested:
+        return None, (), requested_names
+    inspection = service.inspect_workflow(workflow_id)
+    inspection_slots = (
+        inspection.get("slots")
+        if isinstance(inspection, Mapping) and isinstance(inspection.get("slots"), list)
+        else []
+    )
+    available_names = {
+        str(item.get("name"))
+        for item in inspection_slots
+        if isinstance(item, Mapping)
+    }
+    supported = {name: prompt for name, prompt in requested.items() if name in available_names}
+    if not supported:
+        return None, (), requested_names
+    prepared, report = service.prepare_generation(workflow_id, supported)
+    applied = tuple(sorted(
+        str(name)
+        for name in report.get("applied_slots", ())
+        if str(name) in supported
+    ))
+    return prepared, applied, requested_names
+
+
 class ComfyUIService(Protocol):
     def inspect_workflow(self, workflow_id: str) -> Mapping[str, Any]: ...
     async def submit_generation(self, workflow_id: str, slots: Mapping[str, Any], *, mapping: Mapping[str, Any] | None = None) -> Mapping[str, Any]: ...
@@ -118,11 +172,15 @@ class ComfyUIServiceAdapter:
         allowed_reference_roots: tuple[str, ...] = (),
         materialize: Callable[[str, str], Awaitable[str]] | None = None,
         poll_interval: float = 1.0,
+        rewrite_call: Callable[[str], Awaitable[str]] | None = None,
+        native_request: Mapping[str, Any] | None = None,
     ) -> None:
         self.service = service
         self.allowed_reference_roots = allowed_reference_roots
         self.materialize = materialize
         self.poll_interval = max(0.01, poll_interval)
+        self.rewrite_call = rewrite_call
+        self.native_request = dict(native_request or {})
         self._debug_recorder: Any = None
         self._debug_trace_id = ""
 
@@ -172,6 +230,16 @@ class ComfyUIServiceAdapter:
     async def capabilities(self, route: RouteDefinition) -> BackendCapabilitiesV1:
         inspection = self.service.inspect_workflow(route.key.workflow)
         slots = inspection.get("slots") if isinstance(inspection.get("slots"), list) else []
+        if callable(getattr(self.service, "generate_image", None)):
+            images = [item for item in slots if item.get("kind") == "image" and item.get("mode") != "preserve"]
+            roles = tuple(dict.fromkeys(str(item.get("role") or "generic") for item in images))
+            return BackendCapabilitiesV1(
+                text2img=any(item.get("kind") == "prompt" for item in slots),
+                edit=bool(images), negative_prompt=any(str(item.get("name", "")).startswith("negative_prompt") for item in slots),
+                max_reference_images=len(images), reference_roles=() if "generic" in roles else roles,
+                seed=any(str(item.get("name", "")).startswith("seed") for item in slots),
+                async_result=True, source="native_workflow_mapping",
+            )
         names = {str(item.get("name")) for item in slots if isinstance(item, Mapping)}
         reference_names = {
             name for name in names
@@ -205,6 +273,29 @@ class ComfyUIServiceAdapter:
         return base64.b64encode(data).decode("ascii")
 
     async def generate(self, route, spec, prompt, references: ReferencePlan, trace):
+        native_generate = getattr(self.service, "generate_image", None)
+        if callable(native_generate):
+            for reference in references.submitted:
+                if self.allowed_reference_roots and not path_within_roots(reference.path, self.allowed_reference_roots):
+                    raise ValueError("reference path is outside the configured roots")
+            inspection = self.service.inspect_workflow(route.key.workflow)
+            expected = str(route.settings.get("workflow_fingerprint") or "")
+            if expected and expected != inspection["fingerprint"]:
+                raise ValueError("workflow fingerprint changed; mapping must be reviewed")
+            result = await native_generate(route.key.workflow, {
+                "scene": asdict(spec.scene), "character": asdict(spec.character),
+                **self.native_request, "request_text": spec.user_request,
+                "prompt_text": prompt.positive_prompt, "negative_prompt": prompt.negative_prompt,
+                "semantic_prompt_slots": dict(prompt.auxiliary_prompts), "workflow_kind": spec.operation,
+                "reference_asset_roles": [list(r.roles) for r in references.submitted],
+            }, [r.path for r in references.submitted], self.rewrite_call,
+                mapping_override=route.settings.get("mapping"), timeout_seconds=route.timeout_seconds)
+            trace.append({"stage": "native_comfyui_result", "at": time.time(), "data": {"task_id": result["task_id"], "workflow": route.key.workflow, "dimensions": result["dimensions"]}})
+            return GenerationResultV1(request_id=spec.request_id, task_id=result["task_id"], backend=self.backend,
+                                      model_profile=prompt.model_profile, workflow=route.key.workflow,
+                                      image_path=result["image_path"], generation_completed=True,
+                                      submitted_reference_ids=tuple(r.reference_id for r in references.submitted),
+                                      degraded_capabilities=references.degraded_capabilities, trace=tuple(trace))
         inspection = self.service.inspect_workflow(route.key.workflow)
         inspection_slots = inspection.get("slots") if isinstance(inspection.get("slots"), list) else []
         available_slot_names = {
@@ -227,6 +318,24 @@ class ComfyUIServiceAdapter:
         slots: dict[str, Any] = {"positive_prompt": prompt.positive_prompt}
         if prompt.negative_prompt and capabilities.negative_prompt:
             slots["negative_prompt"] = prompt.negative_prompt
+        requested_auxiliary_slots: list[str] = []
+        applied_auxiliary_slots: list[str] = []
+        for name, value in normalize_semantic_prompt_slots(prompt.auxiliary_prompts).items():
+            requested_auxiliary_slots.append(name)
+            if name not in available_slot_names:
+                continue
+            slots[name] = value
+            applied_auxiliary_slots.append(name)
+        if requested_auxiliary_slots:
+            trace.append({
+                "stage": "semantic_prompt_slots",
+                "at": time.time(),
+                "data": {
+                    "requested": sorted(requested_auxiliary_slots),
+                    "applied": sorted(applied_auxiliary_slots),
+                    "unsupported": sorted(set(requested_auxiliary_slots) - set(applied_auxiliary_slots)),
+                },
+            })
         outfit = getattr(spec.wardrobe, "outfit", None)
         outfit_mode = str(getattr(outfit, "mode", "") or "")
         mode_parameters = route.settings.get("outfit_mode_parameters")
@@ -554,5 +663,5 @@ def validate_output_image(path: str, *, max_bytes: int = 50 * 1024 * 1024) -> tu
 __all__ = [
     "redact_sensitive", "path_within_roots", "endpoint_capabilities", "endpoint_model_profile",
     "ComfyUIServiceAdapter", "OnlineEndpointAdapter", "LegacyCallbackAdapter", "GenerationMetrics",
-    "validate_output_image",
+    "validate_output_image", "normalize_semantic_prompt_slots", "prepare_legacy_semantic_workflow",
 ]

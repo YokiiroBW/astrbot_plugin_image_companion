@@ -239,6 +239,7 @@ from .generation_adapters import (
     ComfyUIServiceAdapter,
     GenerationMetrics,
     OnlineEndpointAdapter,
+    prepare_legacy_semantic_workflow,
     validate_output_image,
 )
 from .generation_config import build_route_registry, parse_rollout_config, resolve_wardrobe_profile
@@ -11709,6 +11710,68 @@ Output:
             "表情包场景": "sticker scene",
         }.get(_single_line(name, 40), _single_line(name, 40) or "scene preset")
 
+    def _photo_generation_semantic_prompt_slots(
+        self,
+        sections: tuple[PhotoPromptSection, ...],
+        *,
+        request_text: str = "",
+        requested_scene_preset: str = "",
+        supplied: Mapping[str, Any] | None = None,
+    ) -> dict[str, str]:
+        """Project only high-confidence prompt sections into named workflow slots."""
+        allowed = {
+            "clothing_prompt", "pose_prompt", "background_prompt", "extra_prompt",
+        }
+
+        def compile_sections(*, sources: set[str], names: set[str] | None = None) -> str:
+            values: list[str] = []
+            seen: set[str] = set()
+            for section in sections:
+                if section.source not in sources or (names is not None and section.name not in names):
+                    continue
+                value = compile_local_photo_prompt((section,), "traditional").strip()
+                key = value.casefold()
+                if value and key not in seen:
+                    seen.add(key)
+                    values.append(value)
+            return ", ".join(values)[:4000].strip(" ,")
+
+        projected: dict[str, str] = {}
+        clothing = compile_sections(
+            sources={"wardrobe_structure"},
+            names={"structured_wardrobe"},
+        )
+        if clothing:
+            projected["clothing_prompt"] = clothing
+
+        explicit_pose = bool(
+            self._photo_generation_explicit_back_view_request(request_text)
+            or self._photo_generation_explicit_mirror_request(request_text)
+            or _photo_group_request_matches(request_text)
+        )
+        if explicit_pose:
+            pose = compile_sections(
+                sources={"composition"},
+                names={"composition", "subject_count", "relationship_role_reference"},
+            )
+            if pose:
+                projected["pose_prompt"] = pose
+
+        if _single_line(requested_scene_preset, 80):
+            background = compile_sections(sources={"preset"})
+            if background:
+                projected["background_prompt"] = background
+
+        supplied_values = supplied if isinstance(supplied, Mapping) else {}
+        for raw_name, raw_value in supplied_values.items():
+            name = str(raw_name or "").strip()
+            if name not in allowed or not isinstance(raw_value, str):
+                continue
+            value = raw_value.replace("\x00", " ").strip()[:4000]
+            if value:
+                projected[name] = value
+        return projected
+
     async def _generate_photo_image(
         self,
         **kwargs: Any,
@@ -11747,6 +11810,7 @@ Output:
         workflow_default_scene_preset: str = "",
         prompt_sections: tuple[PhotoPromptSection, ...] | None = None,
         prompt_format: str = "",
+        semantic_prompt_slots: Mapping[str, Any] | None = None,
     ) -> tuple[str, str, str]:
         started = time.time()
         trace_id = self._photo_generation_trace_id(session_key, workflow_kind)
@@ -12321,6 +12385,12 @@ Output:
             resolved_context.prompt_sections,
             prompt_format,
         )
+        semantic_prompt_slots = self._photo_generation_semantic_prompt_slots(
+            resolved_context.prompt_sections,
+            request_text=current_user_request or original_prompt_text,
+            requested_scene_preset=suggested_scene_preset,
+            supplied=semantic_prompt_slots,
+        )
         reference_candidate = dict(resolved_context.reference or {})
         if structured_reference_plan:
             # The public generation record retains only the managed asset ID and
@@ -12518,6 +12588,7 @@ Output:
                 "local_backend_prompt_hash": hashlib.sha256(
                     str(local_backend_prompt_text or "").encode("utf-8", "ignore")
                 ).hexdigest(),
+                "semantic_prompt_slot_names": sorted(semantic_prompt_slots),
                 "prompt_hash": prompt_hash,
                 "submitted_prompt_hash": hashlib.sha256(
                     str(prompt_text or "").encode("utf-8", "ignore")
@@ -12603,6 +12674,7 @@ Output:
             managed_reference_gate=structured_reference_gate,
             managed_reference_plan=structured_reference_plan,
             structured_outfit=structured_outfit,
+            auxiliary_prompts=semantic_prompt_slots,
         )
         if unified_result is not None:
             self._append_photo_generation_trace_event(
@@ -12937,6 +13009,7 @@ Output:
                 reference_asset_ticket=reference_asset_ticket,
                 generation_id=trace_id,
                 structured_reference_count=len(structured_reference_plan.assets),
+                semantic_prompt_slots=semantic_prompt_slots,
             )
             return finish(
                 "ComfyUI",
@@ -12977,7 +13050,7 @@ Output:
                 generation_completed=result.generation_completed,
                 failure_stage=result.failure_stage,
             )
-        if preferred == "comfyui":
+        if preferred == "comfyui" or (preferred == "auto" and self._native_comfyui_service() is not None):
             if not self._comfyui_photo_available():
                 return finish("ComfyUI", "", "ComfyUI 后端不可用或未配置")
             busy_state = self._local_photo_generation_busy_state(force_refresh=True)
@@ -12993,6 +13066,7 @@ Output:
                 session_key=session_key,
                 reference_image_path=reference_image_path,
                 reference_image_paths=reference_image_paths,
+                semantic_prompt_slots=semantic_prompt_slots,
             )
             return finish(
                 "ComfyUI",
@@ -13122,6 +13196,7 @@ Output:
                         session_key=session_key,
                         reference_image_path=reference_image_path,
                         reference_image_paths=reference_image_paths,
+                        semantic_prompt_slots=semantic_prompt_slots,
                     )
                     if image_path:
                         return finish(
@@ -15328,6 +15403,10 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         requested_images: int,
     ) -> int:
         requested = max(1, _safe_int(requested_images, 1, 1))
+        native = self._native_comfyui_service()
+        if native is not None:
+            inspection = native.inspect_workflow(self._choose_photo_workflow_name(workflow_kind))
+            return min(requested, sum(item.get("kind") == "image" and item.get("mode") != "preserve" for item in inspection["slots"]))
         module = self._get_comfyui_module()
         workflow_name = self._choose_photo_workflow_name(workflow_kind)
         if module is None or not workflow_name:
@@ -15846,7 +15925,33 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         reference_asset_ticket: ReferenceAssetTicket | None = None,
         generation_id: str = "",
         structured_reference_count: int = 0,
+        semantic_prompt_slots: Mapping[str, Any] | None = None,
     ) -> tuple[str, str]:
+        native = self._native_comfyui_service()
+        if native is not None:
+            try:
+                context = dict(getattr(self, "_comfyui_task_context", {}) or {})
+                paths = list(reference_image_paths) if not isinstance(reference_image_paths, str) else [reference_image_paths]
+                paths = list(dict.fromkeys(p for p in [reference_image_path, *paths] if p))
+                if reference_asset_gate is not None and reference_asset_ticket is not None:
+                    capacity = sum(s.get("kind") == "image" for s in native.inspect_workflow(workflow_name)["slots"])
+                    paths, status = reference_asset_gate.consume(reference_asset_ticket, generation_id=generation_id, backend="comfyui", capacity=capacity)
+                    if status != "ok" or not paths:
+                        return "", "参考素材票据不可用或工作流没有图片输入"
+                call = self._native_comfyui_model_call() if native.config.get("rewrite_enabled", True) else None
+                outcome = await native.generate_image(workflow_name, {
+                    **context, "prompt_text": prompt_text, "negative_prompt": negative_prompt_text,
+                    "semantic_prompt_slots": semantic_prompt_slots or {},
+                    "image_size": image_size or context.get("image_size", ""),
+                }, paths, call)
+                self._native_comfyui_last_result = outcome
+                return outcome["image_path"], "ok；ComfyUI 任务 " + outcome["task_id"]
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                from .comfyui_workflows import WorkflowError
+                logger.warning("[ImageCompanion] ComfyUI 直连失败: %s", _single_line(exc, 300) if isinstance(exc, WorkflowError) else type(exc).__name__)
+                return "", str(exc) if isinstance(exc, WorkflowError) else "ComfyUI 连接或提示词模型调用失败，请检查配置"
         module = self._get_comfyui_module()
         if module is None:
             return "", "ComfyUI 插件不可用"
@@ -15969,6 +16074,32 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             )
             workflow = module.ComfyUIWorkflow(server_ip, client_id)
             workflow.load_workflow_api(workflow_file)
+            requested_semantic_slots: tuple[str, ...] = ()
+            applied_semantic_slots: tuple[str, ...] = ()
+            if isinstance(semantic_prompt_slots, Mapping) and semantic_prompt_slots:
+                try:
+                    prepared_workflow, applied_semantic_slots, requested_semantic_slots = (
+                        prepare_legacy_semantic_workflow(
+                            self._get_comfyui_public_service(),
+                            Path(workflow_file).name,
+                            semantic_prompt_slots,
+                        )
+                    )
+                    if prepared_workflow is not None:
+                        workflow.workflow_api = prepared_workflow
+                except Exception as exc:
+                    logger.warning(
+                        "[ImageCompanion] ComfyUI 语义槽准备失败，保留原工作流路径: workflow=%s error_type=%s",
+                        _single_line(workflow_name, 80),
+                        type(exc).__name__,
+                    )
+            if requested_semantic_slots:
+                logger.info(
+                    "[ImageCompanion] ComfyUI 语义槽投影: workflow=%s requested=%s applied=%s",
+                    _single_line(workflow_name, 80),
+                    ",".join(sorted(requested_semantic_slots)) or "-",
+                    ",".join(sorted(applied_semantic_slots)) or "-",
+                )
             input_images: list[str] = []
             reference_note = ""
             if use_structured_assets:
@@ -16013,11 +16144,12 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 debug=debug,
             )
             logger.info(
-                "[PrivateCompanion] ComfyUI 生图已提交: workflow=%s prompt_id=%s input_images=%s text_count=%s",
+                "[PrivateCompanion] ComfyUI 生图已提交: workflow=%s prompt_id=%s input_images=%s text_count=%s semantic_slots=%s",
                 _single_line(workflow_name, 80),
                 _single_line(prompt_id, 80),
                 len(input_images),
                 text_count,
+                ",".join(sorted(applied_semantic_slots)) or "-",
             )
             deadline = _now_ts() + self.comfyui_photo_wait_seconds
             while _now_ts() < deadline:
@@ -19982,7 +20114,18 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 continue
         return None
 
+    def _native_comfyui_service(self) -> Any | None:
+        service = getattr(self, "_image_service", None)
+        getter = getattr(service, "native_comfyui_service", None)
+        return getter() if callable(getter) else None
+
+    def _native_comfyui_model_call(self):
+        return self._image_service.comfyui_model_call(getattr(self, "_image_owner", None))
+
     def _get_comfyui_public_service(self) -> Any | None:
+        native = self._native_comfyui_service()
+        if native is not None:
+            return native
         getter = getattr(getattr(self, "context", None), "get_registered_star", None)
         if callable(getter):
             for name in ("comfyui", "ComfyUI", "astrbot_plugin_comfyui"):
@@ -20072,6 +20215,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         managed_reference_gate: Any | None = None,
         managed_reference_plan: Any | None = None,
         structured_outfit: Any | None = None,
+        auxiliary_prompts: Mapping[str, str] | None = None,
     ) -> Any | None:
         config = getattr(self._image_service, "config", {}) or {}
         rollout = parse_rollout_config(config if isinstance(config, dict) else {})
@@ -20142,6 +20286,8 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 comfy_service,
                 allowed_reference_roots=tuple(allowed_roots),
                 materialize=materialize,
+                native_request=dict(getattr(self, "_comfyui_task_context", {}) or {}),
+                rewrite_call=self._native_comfyui_model_call() if self._native_comfyui_service() is not None and comfy_service.config.get("rewrite_enabled", True) else None,
             )
 
         endpoints = self._external_image_api_endpoint_queue(include_incomplete=False)
@@ -20306,6 +20452,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 instructions=(activity,) if activity else (),
             ),
             legacy_prompt=legacy_prompt,
+            auxiliary_prompts=dict(auxiliary_prompts or {}),
         )
         metrics = getattr(self._image_service, "generation_metrics", None)
         if metrics is None:
@@ -23267,7 +23414,7 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
             getattr(self, "comfyui_text2img_workflow_name", "")
             or getattr(self, "comfyui_selfie_workflow_name", "")
         )
-        return workflows_configured and self._get_comfyui_module() is not None
+        return workflows_configured and (self._native_comfyui_service() is not None or self._get_comfyui_module() is not None)
 
     def _sdgen_photo_available(self) -> bool:
         return self._find_sdgen_plugin() is not None
@@ -23375,6 +23522,14 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
 
     async def generate(self, request: dict[str, Any]) -> tuple[str, str, str]:
         payload = dict(request or {})
+        limits = payload.get("limits")
+        if isinstance(limits, dict) and not payload.get("image_size"):
+            payload["image_size"] = str(limits.get("image_size") or "")
+        # Keep the structured task alongside the legacy argument translation.
+        # A fresh runtime is created per task, so context cannot leak between users.
+        self._comfyui_task_context = {
+            key: payload[key] for key in ("request_text", "scene", "character", "image_size", "workflow_kind", "reference_asset_roles") if key in payload
+        }
         # ImageTask v1 carries routing and ownership metadata that the legacy
         # executor never declared. Filter against the live method signature so
         # old installations remain callable without weakening the new task

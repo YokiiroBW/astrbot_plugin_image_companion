@@ -1,4 +1,112 @@
 {
+  "comfyui": {
+    "description": "ComfyUI 独立连接与工作流适配",
+    "type": "object",
+    "items": {
+      "base_url": {
+        "description": "ComfyUI 地址（填写后启用独立直连）",
+        "type": "string",
+        "default": "",
+        "hint": "例如 http://127.0.0.1:8188；不需要安装中间插件。"
+      },
+      "api_key": {
+        "description": "ComfyUI 访问密钥（可选）",
+        "type": "string",
+        "default": "",
+        "secret": true
+      },
+      "workflows": {
+        "description": "API 工作流文件",
+        "type": "list",
+        "default": [],
+        "hint": "每项填写 AstrBot 所在机器可读取的 API JSON 文件路径；也支持 JSON 字符串对象 {\"name\":\"名称\",\"workflow\":{节点字典},\"mapping\":{\"fields\":{},\"output_node\":\"节点ID\"}}。"
+      },
+      "text2img_workflow": {
+        "description": "默认文生图工作流",
+        "type": "string",
+        "default": "",
+        "hint": "填写列表中的文件名或名称。"
+      },
+      "selfie_workflow": {
+        "description": "默认自拍／改图工作流",
+        "type": "string",
+        "default": ""
+      },
+      "rewrite_enabled": {
+        "description": "按工作流重写和拆分提示词",
+        "type": "bool",
+        "default": true
+      },
+      "prompt_provider_id": {
+        "description": "提示词处理模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "用于工作流模型分析和每次提示词重写。生成时留空复用陪伴的生图提示词模型。"
+      },
+      "rewrite_instructions": {
+        "description": "额外重写要求",
+        "type": "text",
+        "default": "",
+        "hint": "例如使用英文标签、保留角色设定，只重写服装和场景。"
+      },
+      "aspect": {
+        "description": "画幅选择",
+        "type": "string",
+        "default": "auto",
+        "options": [
+          "auto",
+          "workflow",
+          "portrait",
+          "landscape",
+          "square"
+        ],
+        "hint": "auto 根据请求和提示词模型建议选择；workflow 保留工作流尺寸。用户明确要求优先。"
+      },
+      "portrait_size": {
+        "description": "竖图尺寸",
+        "type": "string",
+        "default": "1024x1536"
+      },
+      "landscape_size": {
+        "description": "横图尺寸",
+        "type": "string",
+        "default": "1536x1024"
+      },
+      "square_size": {
+        "description": "方图尺寸",
+        "type": "string",
+        "default": "1024x1024"
+      },
+      "size_multiple": {
+        "description": "尺寸步长",
+        "type": "int",
+        "default": 8,
+        "hint": "应符合当前模型和工作流的要求。"
+      },
+      "max_pixels": {
+        "description": "最大像素数",
+        "type": "int",
+        "default": 4194304
+      },
+      "random_seed": {
+        "description": "每次使用新种子",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后保留工作流中的种子。"
+      },
+      "timeout_seconds": {
+        "description": "生成等待秒数",
+        "type": "int",
+        "default": 180
+      },
+      "model_timeout_seconds": {
+        "description": "提示词模型等待秒数",
+        "type": "int",
+        "default": 60
+      }
+    }
+  },
   "enabled": {
     "description": "启用生图扩展服务（配置请到陪伴面板）",
     "type": "bool",
