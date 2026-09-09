@@ -33,7 +33,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
 _PHOTO_GENERATION_TRACE_FILE_LOCK = threading.Lock()
@@ -534,6 +534,30 @@ class SyntheticPrivateWakeEvent(AstrMessageEvent):
             return
         await self.context_obj.send_message(self.session, message)
         await super().send(message)
+
+
+class _PhotoToolEvent(AstrMessageEvent):
+    """Keep the request identity while collecting tool output for host delivery."""
+
+    def __init__(self, source: Any, collect: Any) -> None:
+        self._photo_source = source
+        self._photo_collect = collect
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in {"send", "_photo_source", "_photo_collect"} or name.startswith("__"):
+            return object.__getattribute__(self, name)
+        return getattr(object.__getattribute__(self, "_photo_source"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"_photo_source", "_photo_collect"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._photo_source, name, value)
+
+    async def send(self, message: MessageChain) -> None:
+        # The companion owns final delivery. In particular, do not interpret
+        # a tool's "sent" text as a platform acknowledgement.
+        await self._photo_collect(message)
 
 
 class _CapturedSendMessageCall:
@@ -13098,21 +13122,26 @@ Output:
         if preferred == "tool_call":
             if not self._custom_tool_photo_available():
                 return finish("函数工具", "", "自定义生图函数工具不可用或未配置")
-            image_path, note = await self._run_custom_tool_photo_generation(
+            tool_outcome = self._coerce_external_photo_generation_outcome(await self._run_custom_tool_photo_generation(
                 prompt_text,
                 session_key=session_key,
                 workflow_kind=workflow_kind,
                 reference_image_path=reference_image_path,
                 image_size=image_size,
                 event=event,
-            )
+            ))
+            image_path, note = tool_outcome
             if image_path:
                 return finish(
                     "函数工具",
                     image_path,
                     note,
                     reference_submitted=bool(reference_image_path),
+                    generation_completed=True,
                 )
+            if tool_outcome.generation_completed:
+                return finish("函数工具", "", note, generation_completed=True,
+                              failure_stage=tool_outcome.failure_stage or "result_materialization")
             can_fallback = self._external_photo_available() or self._comfyui_photo_available() or (not reference_image_path and self._sdgen_photo_available())
             if not can_fallback:
                 return finish("函数工具", "", note)
@@ -16352,7 +16381,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         reference_image_path: str = "",
         image_size: str = "",
         event: Any = None,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str] | _ExternalPhotoGenerationOutcome:
         handler = self._find_custom_photo_tool_handler()
         if handler is None:
             return "", "未找到配置的生图函数工具"
@@ -16380,22 +16409,40 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                             kwargs[ek] = ev
             except Exception:
                 logger.warning("[PrivateCompanion] 自定义生图工具额外参数解析失败,已忽略: tool=%s", _single_line(tool_name, 80))
+        captured_paths: list[str] = []
+        image_offered = False
+
+        async def collect(message: Any) -> None:
+            nonlocal image_offered
+            chain = message if isinstance(message, (list, tuple)) else getattr(message, "chain", ())
+            for component in chain or ():
+                if not isinstance(component, Image):
+                    continue
+                image_offered = True
+                for field in ("file", "url", "path"):
+                    candidate = getattr(component, field, None)
+                    if not isinstance(candidate, str) or not candidate:
+                        continue
+                    path, _ = await self._resolve_custom_tool_image_candidate(candidate, session_key=session_key)
+                    if path:
+                        captured_paths.append(path)
+                        break
+
         try:
-            session = self._parse_message_session(session_key)
-            if session is None:
-                session = MessageSession(
-                    platform_name="private_companion",
-                    message_type=MessageType.FRIEND_MESSAGE,
-                    session_id=str(session_key or "custom_tool"),
-                )
-            tool_event = event
-            if tool_event is None:
-                tool_event = SyntheticPrivateWakeEvent(
+            source_event = event
+            if source_event is None:
+                # tool_photo_ is an archive/trace namespace, never a platform ID.
+                routing_key = str(session_key or "").removeprefix("tool_photo_")
+                session = self._parse_message_session(routing_key)
+                if session is None:
+                    return "", "无法为函数工具构造事件上下文：缺少有效的真实会话"
+                source_event = SyntheticPrivateWakeEvent(
                     context=self.context,
                     session=session,
                     message="",
                     sender_name="PrivateCompanion",
                 )
+            tool_event = _PhotoToolEvent(source_event, collect)
         except Exception as exc:
             logger.warning("[PrivateCompanion] 构造自定义工具事件失败: %s", _single_line(exc, 160))
             return "", f"无法为函数工具构造事件上下文：{_single_line(exc, 120)}"
@@ -16408,19 +16455,39 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             bool(reference_image_path),
             list(kwargs.keys()),
         )
+        # Select the calling convention before execution. A TypeError raised
+        # inside a generating tool must not submit the same task a second time.
+        positional_event = True
         try:
-            result = await handler(tool_event, **kwargs)
-        except TypeError:
+            signature = inspect.signature(handler)
             try:
-                result = await handler(event=tool_event, **kwargs)
-            except Exception as exc:
-                logger.warning("[PrivateCompanion] 自定义工具生图调用失败(keyword): %s", _single_line(exc, 200))
-                return "", f"函数工具调用失败：{_single_line(exc, 160)}"
+                signature.bind(tool_event, **kwargs)
+            except TypeError:
+                signature.bind(event=tool_event, **kwargs)
+                positional_event = False
+        except (TypeError, ValueError):
+            pass
+        tool_error = ""
+        try:
+            result = await handler(tool_event, **kwargs) if positional_event else await handler(event=tool_event, **kwargs)
         except Exception as exc:
             logger.warning("[PrivateCompanion] 自定义工具生图调用失败: %s", _single_line(exc, 200))
-            return "", f"函数工具调用失败：{_single_line(exc, 160)}"
-        result_text = str(result or "") if not isinstance(result, str) else result
+            if not image_offered:
+                return "", f"函数工具调用失败：{_single_line(exc, 160)}"
+            tool_error = type(exc).__name__
+            result = ""
+        if captured_paths:
+            return _ExternalPhotoGenerationOutcome(captured_paths[0], f"ok ({_single_line(tool_name, 60)})；工具图片已归档，交由陪伴发送", True)
+        result_text = json.dumps(result, ensure_ascii=False) if isinstance(result, (dict, list)) else str(result or "")
+        reported = (
+            any(result.get(key) is True for key in ("generated", "generation_completed", "ok"))
+            if isinstance(result, dict)
+            else bool(re.search(r"(?:已|已经)(?:成功)?(?:生成|完成)|(?<!not )\b(?:generated|completed)\b", result_text, flags=re.I))
+        )
+        generated = image_offered or reported
         if not result_text.strip():
+            if generated:
+                return _ExternalPhotoGenerationOutcome(note=f"工具已生成图片，但图片归档失败{('：' + tool_error) if tool_error else ''}", generation_completed=True, failure_stage="result_materialization")
             return "", "函数工具返回空结果"
         image_path, parse_note = await self._parse_custom_tool_photo_result(result_text, session_key=session_key)
         if image_path:
@@ -16431,21 +16498,16 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 _single_line(parse_note, 120),
                 _single_line(result_text, 180),
             )
-            tool_reported_delivery = bool(
-                re.search(
-                    r"(?<!未)(?:已|已经)\s*(?:成功)?\s*(?:发送|发出)|\b(?:sent|delivered)\b",
-                    result_text,
-                    flags=re.I,
-                )
-            )
-            delivery_marker = ";tool_delivery_confirmed" if tool_reported_delivery else ""
-            return image_path, f"ok ({_single_line(tool_name, 60)}){delivery_marker}"
+            return _ExternalPhotoGenerationOutcome(image_path, f"ok ({_single_line(tool_name, 60)})", True)
         logger.info(
             "[PrivateCompanion] 自定义工具生图未解析到图片: tool=%s result_preview=%s",
             _single_line(tool_name, 80),
             _single_line(result_text, 220),
         )
-        return "", f"函数工具返回结果未包含可识别的图片路径或数据：{_single_line(result_text, 160)}"
+        return _ExternalPhotoGenerationOutcome(
+            note=("工具已生成图片，但结果解析或归档失败：" if generated else "函数工具返回结果未包含可识别的图片路径或数据：") + _single_line(result_text, 160),
+            generation_completed=generated, failure_stage="result_materialization" if generated else "",
+        )
 
     async def _parse_custom_tool_photo_result(
         self,
@@ -16461,20 +16523,16 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             json_data = json.loads(text)
         except Exception:
             pass
-        if isinstance(json_data, dict):
-            for key in ("image_path", "path", "file_path", "file", "image", "image_url", "url", "image_base64", "base64", "data"):
-                val = json_data.get(key)
-                if not val:
-                    continue
-                val_str = str(val).strip()
-                if not val_str:
-                    continue
-                resolved, note = await self._resolve_custom_tool_image_candidate(val_str, session_key=session_key)
-                if resolved:
-                    return resolved, note
-            for val in json_data.values():
-                if not isinstance(val, str):
-                    continue
+        pending = [json_data]
+        for _ in range(64):
+            if not pending:
+                break
+            val = pending.pop(0)
+            if isinstance(val, dict):
+                pending.extend(val[key] for key in ("image_path", "path", "file_path", "file", "image", "image_url", "url", "image_base64", "base64", "data", "outputs", "images") if key in val)
+            elif isinstance(val, list):
+                pending.extend(val[:32])
+            elif isinstance(val, str):
                 resolved, note = await self._resolve_custom_tool_image_candidate(val, session_key=session_key)
                 if resolved:
                     return resolved, note
@@ -16483,7 +16541,14 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             resolved, note = await self._resolve_custom_tool_image_candidate(url, session_key=session_key)
             if resolved:
                 return resolved, note
-        path_matches = re.findall(r'(?:[/\\][A-Za-z]:[\\/]|[A-Za-z]:[\\/]|/[\w\-./]+|[\w\-./]+\.(?:png|jpg|jpeg|webp|gif|bmp))', text)
+        # Capture the entire absolute path, including Windows drive/UNC paths,
+        # spaces and localized directory names. Require an image extension so
+        # trailing tool prose and markdown delimiters are not part of the path.
+        path_matches = re.findall(
+            r'''(?:file://(?:/|[^/\s]+/)|[A-Za-z]:[\\/]|\\\\[^\\\s]+\\|/)[^\r\n<>"|]*?\.(?:png|jpe?g|webp|gif|bmp)(?=$|[\s,;，；。)\]"'`])''',
+            text, flags=re.I,
+        )
+        path_matches.extend(re.findall(r'[\w\-./]+\.(?:png|jpe?g|webp|gif|bmp)\b', text, flags=re.I))
         for path_str in path_matches:
             resolved, note = await self._resolve_custom_tool_image_candidate(path_str, session_key=session_key)
             if resolved:
@@ -16508,6 +16573,13 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         session_key: str,
     ) -> tuple[str, str]:
         text = str(candidate or "").strip().strip('"').strip("'").strip()
+        if text.lower().startswith("file://"):
+            parsed = urlparse(text)
+            text = unquote(parsed.path)
+            if parsed.netloc and parsed.netloc.lower() != "localhost":
+                text = "//" + parsed.netloc + text
+            elif re.match(r"^/[A-Za-z]:/", text):
+                text = text[1:]
         if not text or len(text) < 3:
             return "", "候选为空"
         if text.lower().startswith(("http://", "https://")):
@@ -16517,7 +16589,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             path = Path(text)
             if path.exists() and path.is_file():
                 size = path.stat().st_size
-                if size > 100:
+                if size > 0:
                     raw = await asyncio.to_thread(path.read_bytes)
                     extension = self._external_image_extension_from_bytes(raw)
                     if extension:
@@ -16528,6 +16600,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                         )
                         if archived:
                             return archived, "本地文件已归档"
+                        return "", "图片已生成但归档失败"
                     return str(path), "本地文件"
         except Exception:
             pass
