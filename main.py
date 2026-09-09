@@ -27,7 +27,7 @@ from .comfyui_workflows import WorkflowError
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.4.2"
+PLUGIN_VERSION = "0.4.3"
 PLUGIN_DISPLAY_NAME = "我会画给你看"
 STATUS_SCHEMA_VERSION = "image.status.v1"
 API_VERSION = "image.generation-api.v1"
@@ -230,7 +230,7 @@ class ImageCompanionExtensionAPI:
             return "provider_timeout", "provider"
         if any(marker in text for marker in ("安全", "策略", "policy", "rejected", "拒绝")):
             return "provider_rejected", "provider"
-        if any(marker in text for marker in ("下载", "落盘", "文件", "materialization")):
+        if any(marker in text for marker in ("下载", "落盘", "归档", "文件", "materialization")):
             return "result_materialization_failed", "result"
         if any(marker in text for marker in ("路由", "route", "workflow")):
             return "route_failed", "routing"
