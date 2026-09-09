@@ -355,6 +355,28 @@ async def test_poll_timeout_cancels_target_without_masking_timeout(tmp_path):
     assert not service._tasks
 
 
+@pytest.mark.asyncio
+async def test_materialization_error_cancels_target_once_and_preserves_error(tmp_path):
+    service = ComfyUIService({"base_url": "http://test.invalid", "workflows": [{"name": "test", "workflow": graph()}]}, tmp_path)
+    calls = []
+
+    async def request(method, path, **kwargs):
+        calls.append((method, path))
+        if path == "/prompt":
+            return {"prompt_id": "task"}
+        return {"task": {"status": {"status_str": "success"}, "outputs": {"5": {"images": [{"filename": "result.png"}]}}}}
+
+    async def download(_url):
+        raise RuntimeError("disk full")
+
+    service._request = request
+    service.download = download
+    with pytest.raises(RuntimeError, match="disk full"):
+        await service.generate_image("test", {"prompt_text": "a beach"}, [])
+    assert calls == [("POST", "/prompt"), ("GET", "/history/task"), ("POST", "/queue")]
+    assert not service._tasks
+
+
 def test_invalid_native_config_degrades_without_breaking_other_backends(tmp_path):
     plugin = ImageCompanionPlugin.__new__(ImageCompanionPlugin)
     plugin.config = {"comfyui": {"base_url": "http://user:password@example.invalid"}}

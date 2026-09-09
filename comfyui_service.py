@@ -316,6 +316,7 @@ class ComfyUIService:
         if not task_id:
             raise WorkflowError("ComfyUI 未返回任务编号")
         self._tasks[task_id] = mapping["output_node"]
+        cleanup_attempted = False
         try:
             deadline = time.monotonic() + max(5, min(1800, int(timeout_seconds or self.config.get("timeout_seconds", 180))))
             while time.monotonic() < deadline:
@@ -342,10 +343,21 @@ class ComfyUIService:
                     return {"image_path": path, "task_id": task_id, "workflow": workflow_id, "fingerprint": stamp,
                             "dimensions": dimensions, "prompt_slots": {k: v for k, v in slots.items() if mapping["fields"][k]["kind"] == "prompt"}}
                 await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
+            cleanup_attempted = True
             await self._cancel_best_effort(task_id)
             raise WorkflowError(f"等待 ComfyUI 超时，任务 {task_id} 可能仍在执行；未自动重新生成")
         except asyncio.CancelledError:
-            await self._cancel_best_effort(task_id)
+            if not cleanup_attempted:
+                cleanup_attempted = True
+                await self._cancel_best_effort(task_id)
+            raise
+        except Exception:
+            # Once /prompt has succeeded, every later failure must attempt a
+            # targeted cleanup. The helper deliberately swallows cleanup
+            # errors so the provider or materialization error remains visible.
+            if not cleanup_attempted:
+                cleanup_attempted = True
+                await self._cancel_best_effort(task_id)
             raise
         finally:
             self._tasks.pop(task_id, None)
