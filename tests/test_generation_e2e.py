@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -10,9 +11,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS_ROOT = ROOT / "tests"
-COMFY_CANDIDATES = (
-    ROOT.parent / "comfyui-plugin",
-    ROOT.parent / "astrbot_plugin_comfyui",
+COMFY_CANDIDATES = tuple(
+    path
+    for path in (
+        Path(os.environ["COMFYUI_PLUGIN_PATH"])
+        if os.environ.get("COMFYUI_PLUGIN_PATH")
+        else None,
+        ROOT.parent / "comfyui-plugin",
+        ROOT.parent / "astrbot_plugin_comfyui",
+    )
+    if path is not None
 )
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(TESTS_ROOT))
@@ -59,7 +67,17 @@ class UnifiedGenerationEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "1": {"class_type": "Simple String", "_meta": {"title": "Positive Prompt"}, "inputs": {"text": ""}},
                 "2": {"class_type": "Simple String", "_meta": {"title": "Negative Prompt"}, "inputs": {"text": ""}},
                 "3": {"class_type": "ETN_LoadImageBase64", "_meta": {"title": "Identity Reference"}, "inputs": {"image": ""}},
-                "4": {"class_type": "KSampler", "inputs": {"seed": 1, "steps": 20}},
+                "6": {"class_type": "AstrBot Prompt Router", "inputs": {"prompt": ["1", 0]}},
+                "7": {"class_type": "AnimaPromptPlusClipEncode", "inputs": {
+                    "text": "",
+                    "clothing_tags": ["6", 0],
+                    "pose_tags": ["6", 1],
+                    "background_tags": ["6", 2],
+                    "extra_prompt": ["6", 3],
+                }},
+                "4": {"class_type": "KSampler", "inputs": {
+                    "positive": ["7", 0], "negative": ["2", 0], "seed": 1, "steps": 20,
+                }},
                 "5": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
             }), encoding="utf-8")
             identity = root / "identity.png"
@@ -87,9 +105,14 @@ class UnifiedGenerationEndToEndTests(unittest.IsolatedAsyncioTestCase):
             engine = GenerationEngine(default_model_profile_registry(), routes, {"comfyui": adapter})
             result = await engine.generate(spec, "anima")
             self.assertTrue(result.ok)
-            self.assertIn("summer pajamas", transport.prompt["1"]["inputs"]["text"])
+            self.assertIn("summer pajamas", transport.prompt["6"]["inputs"]["prompt"])
+            self.assertEqual("", transport.prompt["1"]["inputs"]["text"])
             self.assertIn("wool sweater", transport.prompt["2"]["inputs"]["text"])
             self.assertTrue(transport.prompt["3"]["inputs"]["image"])
+            self.assertIn("summer pajamas", transport.prompt["7"]["inputs"]["clothing_tags"])
+            self.assertIn("upper body selfie", transport.prompt["7"]["inputs"]["pose_tags"])
+            self.assertIn("bedroom", transport.prompt["7"]["inputs"]["background_tags"])
+            self.assertIn("long pink hair", transport.prompt["7"]["inputs"]["extra_prompt"])
 
     async def test_route_cache_key_performance(self):
         spec = _spec()

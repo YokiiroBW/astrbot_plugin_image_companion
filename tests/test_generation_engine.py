@@ -146,6 +146,16 @@ class ContractAndCompilerTests(unittest.TestCase):
         self.assertIn("wool sweater", compiled.negative_prompt)
         self.assertNotIn("wool sweater", compiled.positive_prompt)
         self.assertNotRegex(compiled.positive_prompt, r"\d+(?:\.\d+)?::|[{}\[\]]")
+        self.assertEqual(
+            {
+                "clothing_prompt", "pose_prompt", "background_prompt", "extra_prompt",
+            },
+            set(compiled.auxiliary_prompts),
+        )
+        self.assertIn("lightweight summer pajamas", compiled.auxiliary_prompts["clothing_prompt"])
+        self.assertIn("upper body selfie", compiled.auxiliary_prompts["pose_prompt"])
+        self.assertIn("bedroom", compiled.auxiliary_prompts["background_prompt"])
+        self.assertIn("long pink hair", compiled.auxiliary_prompts["extra_prompt"])
 
     def test_anima_compiler_receives_structured_outfit_terms(self):
         from generation_policy import resolve_structured_outfit

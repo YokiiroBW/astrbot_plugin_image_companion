@@ -18,6 +18,7 @@ from generation_adapters import (  # noqa: E402
     endpoint_capabilities,
     endpoint_model_profile,
     path_within_roots,
+    prepare_legacy_semantic_workflow,
     redact_sensitive,
     validate_output_image,
 )
@@ -42,6 +43,10 @@ class _Service:
                 {"name": "seed"},
                 {"name": "image_output"},
                 {"name": "lora_strength"},
+                {"name": "clothing_prompt"},
+                {"name": "pose_prompt"},
+                {"name": "background_prompt"},
+                {"name": "extra_prompt"},
             ]
         }
 
@@ -87,6 +92,40 @@ class EndpointProfileTests(unittest.TestCase):
         metrics.record(route="anima", ok=False, elapsed_ms=30, error_code="backend_timeout")
         self.assertEqual(1, metrics.snapshot()["counters"]["error:backend_timeout"])
 
+    def test_legacy_semantic_preparation_is_allowlisted_and_capability_gated(self):
+        class Service:
+            received = None
+
+            def inspect_workflow(self, workflow_id):
+                return {
+                    "slots": [
+                        {"name": "positive_prompt"},
+                        {"name": "clothing_prompt"},
+                        {"name": "pose_prompt"},
+                    ]
+                }
+
+            def prepare_generation(self, workflow_id, slots):
+                self.received = dict(slots)
+                return {"prepared": True}, {"applied_slots": list(slots)}
+
+        service = Service()
+        prepared, applied, requested = prepare_legacy_semantic_workflow(
+            service,
+            "小爱+文本1+图片0.json",
+            {
+                "clothing_prompt": "red jacket",
+                "pose_prompt": "",
+                "background_prompt": "rainy street",
+                "arbitrary_node_input": "must not pass",
+            },
+        )
+
+        self.assertEqual({"prepared": True}, prepared)
+        self.assertEqual(("clothing_prompt",), applied)
+        self.assertEqual(("background_prompt", "clothing_prompt"), requested)
+        self.assertEqual({"clothing_prompt": "red jacket"}, service.received)
+
 
 class ComfyUIAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_outfit_mode_lora_parameter_is_capability_gated(self):
@@ -105,7 +144,7 @@ class ComfyUIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(0.7, service.slots["lora_strength"])
         self.assertNotIn("unknown", service.slots)
-        self.assertEqual("outfit_mode_parameters", result.trace[1]["stage"])
+        self.assertIn("outfit_mode_parameters", [item["stage"] for item in result.trace])
 
     async def test_anima_prompt_and_reference_use_named_slots(self):
         service = _Service()
@@ -134,10 +173,53 @@ class ComfyUIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("summer pajamas", service.slots["positive_prompt"])
             self.assertIn("wool sweater", service.slots["negative_prompt"])
             self.assertIn("identity_image", service.slots)
+            self.assertEqual("lightweight summer pajamas", service.slots["clothing_prompt"])
+            self.assertIn("upper body selfie", service.slots["pose_prompt"])
+            self.assertIn("bedroom", service.slots["background_prompt"])
+            self.assertIn("long pink hair", service.slots["extra_prompt"])
             self.assertEqual(
-                ["workflow_mapping", "submission", "result"],
+                ["workflow_mapping", "semantic_prompt_slots", "submission", "result"],
                 [item["stage"] for item in result.trace],
             )
+
+    async def test_semantic_prompts_are_capability_gated_and_unknown_names_are_ignored(self):
+        class LegacyWorkflowService(_Service):
+            def inspect_workflow(self, workflow_id):
+                value = super().inspect_workflow(workflow_id)
+                value["slots"] = [
+                    item for item in value["slots"]
+                    if item["name"] not in {
+                        "clothing_prompt", "pose_prompt", "background_prompt", "extra_prompt",
+                    }
+                ]
+                return value
+
+        service = LegacyWorkflowService()
+        spec = _spec()
+        prompt = replace(
+            AnimaPromptCompiler().compile(spec),
+            auxiliary_prompts={
+                "clothing_prompt": "red dress",
+                "arbitrary_node_input": "must not pass",
+                "pose_prompt": "",
+            },
+        )
+        route = RouteDefinition(
+            "legacy-workflow",
+            RouteKey("comfyui", "anima", "selfie", "legacy.json"),
+            timeout_seconds=2,
+        )
+
+        result = await ComfyUIServiceAdapter(service, poll_interval=0.01).generate(
+            route, spec, prompt, ReferencePlan((), (), (), True), [],
+        )
+
+        self.assertTrue(result.ok)
+        self.assertNotIn("clothing_prompt", service.slots)
+        self.assertNotIn("pose_prompt", service.slots)
+        self.assertNotIn("arbitrary_node_input", service.slots)
+        semantic_event = next(item for item in result.trace if item["stage"] == "semantic_prompt_slots")
+        self.assertEqual(["clothing_prompt"], semantic_event["data"]["unsupported"])
 
     async def test_confirmed_route_mapping_is_forwarded_to_public_service(self):
         service = _Service()

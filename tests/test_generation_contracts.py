@@ -45,6 +45,16 @@ class VersionedContractTests(unittest.TestCase):
             ReferenceBindingV1("ref", "/tmp/a.png", roles=("unknown",)).validate()
         with self.assertRaises(ContractValidationError):
             GenerationResultV1(image_path="/tmp/a.png", error_code="submission_failed").validate()
+        with self.assertRaises(ContractValidationError):
+            PromptPackageV1(
+                positive_prompt="portrait",
+                auxiliary_prompts={"arbitrary_node_input": "bad"},
+            ).validate()
+        with self.assertRaises(ContractValidationError):
+            PromptPackageV1(
+                positive_prompt="portrait",
+                auxiliary_prompts={"pose_prompt": 123},
+            ).validate()
 
     def test_workflow_manifest_rejects_duplicate_node_inputs(self):
         slot = WorkflowSlotV1("positive_prompt", "1", "text", "string")

@@ -4,6 +4,13 @@ import importlib
 import pathlib
 import sys
 import types
+from enum import Enum
+
+
+class _MessageType(str, Enum):
+    FRIEND_MESSAGE = "FriendMessage"
+    GROUP_MESSAGE = "GroupMessage"
+    OTHER_MESSAGE = "OtherMessage"
 
 
 class _Dummy:
@@ -32,7 +39,7 @@ class _Dummy:
         return resolve().__await__()
 
 
-def load_runtime_module():
+def load_runtime_module(*, package_name="photo_runtime_test_package", load_main=False):
     external_modules = (
         "astrbot",
         "astrbot.api",
@@ -95,6 +102,8 @@ def load_runtime_module():
     event.AstrMessageEvent = _Dummy
     event.MessageChain = _Dummy
     event.filter = _Dummy()
+    event.filter.command = lambda *args, **kwargs: lambda fn: fn
+    event.filter.permission_type = lambda *args, **kwargs: lambda fn: fn
     sys.modules["astrbot.api.provider"].ProviderRequest = _Dummy
     star = sys.modules["astrbot.api.star"]
     star.Context = _Dummy
@@ -116,7 +125,7 @@ def load_runtime_module():
     sys.modules["astrbot.core.platform.astrbot_message"].AstrBotMessage = _Dummy
     sys.modules["astrbot.core.platform.astrbot_message"].MessageMember = _Dummy
     sys.modules["astrbot.core.platform.message_session"].MessageSession = _Dummy
-    sys.modules["astrbot.core.platform.message_type"].MessageType = _Dummy
+    sys.modules["astrbot.core.platform.message_type"].MessageType = _MessageType
     sys.modules["astrbot.core.platform.platform"].PlatformStatus = _Dummy
     sys.modules["astrbot.core.platform.platform_metadata"].PlatformMetadata = _Dummy
     sys.modules["astrbot.core.provider.entities"].LLMResponse = _Dummy
@@ -125,12 +134,14 @@ def load_runtime_module():
     sys.modules["astrbot.core.star.star_handler"].star_handlers_registry = []
     sys.modules["astrbot.core.utils.astrbot_path"].get_astrbot_data_path = lambda: pathlib.Path(".")
 
-    package_name = "photo_runtime_test_package"
     package = types.ModuleType(package_name)
     package.__path__ = [str(pathlib.Path(__file__).resolve().parents[1])]
     sys.modules[package_name] = package
     try:
-        return importlib.import_module(f"{package_name}.image_runtime")
+        runtime = importlib.import_module(f"{package_name}.image_runtime")
+        if load_main:
+            importlib.import_module(f"{package_name}.main")
+        return runtime
     finally:
         for name in created:
             if previous[name] is None:
