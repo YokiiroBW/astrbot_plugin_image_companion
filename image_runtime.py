@@ -16006,7 +16006,8 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                             type(exc).__name__,
                         )
                 self._native_comfyui_last_result = outcome
-                return outcome["image_path"], "ok；ComfyUI 任务 " + outcome["task_id"]
+                fallback_note = "；提示词重写不可用，已使用原提示词" if outcome.get("rewrite_fallback") else ""
+                return outcome["image_path"], "ok；ComfyUI 任务 " + outcome["task_id"] + fallback_note
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

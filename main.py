@@ -27,7 +27,7 @@ from .comfyui_workflows import WorkflowError
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.4.3"
+PLUGIN_VERSION = "0.4.5"
 PLUGIN_DISPLAY_NAME = "我会画给你看"
 STATUS_SCHEMA_VERSION = "image.status.v1"
 API_VERSION = "image.generation-api.v1"
@@ -253,7 +253,7 @@ class ImageCompanionExtensionAPI:
             raw = Path(image_path).read_bytes()
             _suffix, media_type = self._image_content_type(raw)
             media_type = media_type or "image/jpeg"
-            return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "succeeded", "backend": "comfyui" if str(outcome.get("backend") or "").lower() == "comfyui" else "external", "backend_task_id": str((outcome.get("metadata") or {}).get("task_id") or request_id), "output": {"asset_id": "image_" + request_id[:32], "kind": "image", "media_type": media_type, "local_path": image_path, "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, "error": None, "degraded_capabilities": []}
+            return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "succeeded", "backend": "comfyui" if str(outcome.get("backend") or "").lower() == "comfyui" else "external", "backend_task_id": str((outcome.get("metadata") or {}).get("task_id") or request_id), "output": {"asset_id": "image_" + request_id[:32], "kind": "image", "media_type": media_type, "local_path": image_path, "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, "error": None, "degraded_capabilities": ["prompt_rewrite:original"] if (outcome.get("metadata") or {}).get("rewrite_fallback") else []}
         error_code, error_stage = self._generation_failure_code(outcome)
         return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "failed", "backend": "", "backend_task_id": "", "output": None, "error": {"code": error_code, "stage": error_stage}, "degraded_capabilities": []}
 
@@ -436,7 +436,7 @@ class ImageCompanionExtensionAPI:
         )
         native_result = getattr(runtime, "_native_comfyui_last_result", None)
         if isinstance(native_result, dict):
-            metadata.update({key: native_result[key] for key in ("task_id", "workflow", "fingerprint", "dimensions") if key in native_result})
+            metadata.update({key: native_result[key] for key in ("task_id", "workflow", "fingerprint", "dimensions", "rewrite_fallback", "rewrite_fallback_reason") if key in native_result})
         await self._plugin.persist_image_state()
         return {
             "handled": True,
@@ -543,10 +543,9 @@ class ImageCompanionPlugin(Star):
     def comfyui_model_call(self, owner: Any = None):
         config = self.config.get("comfyui", {})
         provider_id = str(config.get("prompt_provider_id") or getattr(owner, "photo_prompt_provider_id", "") or "").strip()
-        if not provider_id:
-            raise WorkflowError("请在 ComfyUI 设置中选择提示词处理模型")
-
         async def call(prompt: str) -> str:
+            if not provider_id:
+                raise WorkflowError("请在 ComfyUI 设置中选择提示词处理模型")
             timeout = max(10, min(180, int(config.get("model_timeout_seconds", 60))))
             try:
                 response = await asyncio.wait_for(
