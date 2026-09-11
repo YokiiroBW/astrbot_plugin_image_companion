@@ -16,7 +16,7 @@ FIELDS = {
 POSITIVE = {"clothing_prompt": "blue shirt", "pose_prompt": "sitting", "background_prompt": "window", "extra_prompt": "soft light"}
 
 
-@pytest.mark.parametrize("negative", ["missing", None, ""])
+@pytest.mark.parametrize("negative", ["missing", None, "", " \n\t "])
 def test_empty_negative_retains_companion_constraints_and_workflow_defaults(negative):
     raw = dict(POSITIVE)
     if negative != "missing":

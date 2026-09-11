@@ -68,7 +68,8 @@ def _normalize_rewrite_output(answer: Mapping[str, Any], fields: Mapping[str, An
     supplied = request.get("semantic_prompt_slots")
     supplied = supplied if isinstance(supplied, Mapping) else {}
     for name in fields:
-        if name.startswith("negative_prompt") and slots.get(name) in (None, ""):
+        value = slots.get(name)
+        if name.startswith("negative_prompt") and (value is None or isinstance(value, str) and not value.strip()):
             # Preserve constraints already compiled by the companion. An
             # omitted/null supplemental negative must not erase them.
             slots[name] = request.get("negative_prompt") or ""

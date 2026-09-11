@@ -10007,6 +10007,8 @@ Output:
         workflow_fixed_prompt_audit: dict[str, Any] | None = None,
         generation_completed: bool = False,
         failure_stage: str = "",
+        task_id: str = "",
+        degraded_capabilities: tuple[str, ...] = (),
     ) -> None:
         try:
             reference_candidate = reference_candidate or {}
@@ -10046,6 +10048,12 @@ Output:
                 "ok": bool(ok),
                 "generation_completed": bool(generation_completed),
                 "failure_stage": _single_line(failure_stage, 60),
+                "task_id": _single_line(task_id, 256),
+                "degraded_capabilities": list(dict.fromkeys(
+                    _single_line(value, 120)
+                    for value in (degraded_capabilities or ())
+                    if _single_line(value, 120)
+                ))[:12],
                 "prompt_format": (
                     self._normalize_photo_generation_prompt_format(prompt_format)
                     if prompt_format
@@ -12793,6 +12801,8 @@ Output:
             structured_reference_submitted: bool = False,
             generation_completed: bool = False,
             failure_stage: str = "",
+            task_id: str = "",
+            degraded_capabilities: tuple[str, ...] = (),
         ) -> tuple[str, str, str]:
             elapsed_ms = int((time.time() - started) * 1000)
             actual_submitted_prompt = (
@@ -12927,6 +12937,8 @@ Output:
                 workflow_fixed_prompt_audit=workflow_fixed_prompt_audit,
                 generation_completed=generation_completed,
                 failure_stage=failure_stage,
+                task_id=task_id,
+                degraded_capabilities=degraded_capabilities,
             )
             self._append_photo_generation_trace_event(
                 trace_id,
@@ -12988,13 +13000,18 @@ Output:
                     unified_result.note or "ok",
                     reference_submitted=bool(unified_result.submitted_reference_ids),
                     generation_completed=unified_result.generation_completed,
+                    task_id=unified_result.task_id,
+                    degraded_capabilities=unified_result.degraded_capabilities,
                 )
             if rollout.mode == "active" and rollout.engine_enabled:
                 return finish(
                     f"统一引擎/{unified_result.backend or 'route'}",
                     "",
                     unified_result.note or unified_result.error_code or "统一生图路线失败",
+                    generation_completed=unified_result.generation_completed,
                     failure_stage=unified_result.failure_stage,
+                    task_id=unified_result.task_id,
+                    degraded_capabilities=unified_result.degraded_capabilities,
                 )
 
         if structured_reference_plan:
@@ -16549,22 +16566,40 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             r'''(?:file://(?:/|[^/\s]+/)|[A-Za-z]:[\\/]|\\\\[^\\\s]+\\|/)[^\r\n<>"|]*?\.(?:png|jpe?g|webp|gif|bmp)(?=$|[\s,;，；。)\]"'`])''',
             text, flags=re.I,
         )
+        # Tool prose may contain a relative workspace path with spaces, such
+        # as ``outputs/final image.png``. Keep the slash as an anchor so
+        # ordinary prose ending in ``image.png`` is not treated as a path.
+        relative_path_matches = re.findall(
+            r'''(?:(?:\.{1,2}[\\/])|(?:[^\\/\s<>"|]+[\\/]))[^\r\n<>"|]*?\.(?:png|jpe?g|webp|gif|bmp)(?=$|[\s,;，；。)\]"'`])''',
+            text,
+            flags=re.I,
+        )
+        path_matches.extend(relative_path_matches)
         path_matches.extend(re.findall(r'[\w\-./]+\.(?:png|jpe?g|webp|gif|bmp)\b', text, flags=re.I))
         for path_str in path_matches:
             resolved, note = await self._resolve_custom_tool_image_candidate(path_str, session_key=session_key)
             if resolved:
                 return resolved, note
-        b64_match = re.search(r'(?:data:image/[a-z]+;base64,)?([A-Za-z0-9+/]{256,}={0,2})', text)
-        if b64_match:
-            b64_data = b64_match.group(1)
-            try:
-                image_bytes = base64.b64decode(b64_data)
-                if image_bytes and len(image_bytes) > 100:
-                    path = await self._save_external_generated_image(image_bytes, session_key=session_key, ext=".png")
-                    if path:
-                        return path, "base64 已保存"
-            except Exception:
-                pass
+        # Reuse the normal candidate materializer for data URIs and plain
+        # base64. This validates the decoded image signature, so a long prose
+        # fragment cannot be mistaken for an image, and also accepts tiny
+        # valid images whose encoded form is shorter than the old threshold.
+        data_uri_matches = re.findall(
+            r'''data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}(?=$|[\s"'`<>,;，。；）)\]])''',
+            text,
+            flags=re.I,
+        )
+        for candidate in data_uri_matches:
+            resolved, note = await self._resolve_custom_tool_image_candidate(candidate, session_key=session_key)
+            if resolved:
+                return resolved, note
+        for match in re.finditer(
+            r'''(?<![A-Za-z0-9+/])([A-Za-z0-9+/]{16,}={0,2})(?![A-Za-z0-9+/=])''',
+            text,
+        ):
+            resolved, note = await self._resolve_custom_tool_image_candidate(match.group(1), session_key=session_key)
+            if resolved:
+                return resolved, note
         return "", "未找到可识别的图片"
 
     async def _resolve_custom_tool_image_candidate(
@@ -16583,6 +16618,14 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 text = text[1:]
         if not text or len(text) < 3:
             return "", "候选为空"
+        if text.lower().startswith("data:image/") and ";base64," in text.lower():
+            header, encoded = text.split(",", 1)
+            if re.fullmatch(r"data:image/[a-z0-9.+-]+;base64", header.strip(), flags=re.I):
+                return await self._materialize_external_image_base64(
+                    encoded,
+                    session_key=session_key,
+                    success_note="base64 已保存",
+                )
         if text.lower().startswith(("http://", "https://")):
             path, note = await self._download_external_image_url(text, session_key=session_key)
             return path, note
@@ -16605,15 +16648,14 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     return str(path), "本地文件"
         except Exception:
             pass
-        if re.match(r'^[A-Za-z0-9+/]{256,}={0,2}$', text):
-            try:
-                image_bytes = base64.b64decode(text)
-                if image_bytes and len(image_bytes) > 100:
-                    path = await self._save_external_generated_image(image_bytes, session_key=session_key, ext=".png")
-                    if path:
-                        return path, "base64 已保存"
-            except Exception:
-                pass
+        if re.fullmatch(r"[A-Za-z0-9+/=\s]{16,}", text):
+            path, note = await self._materialize_external_image_base64(
+                text,
+                session_key=session_key,
+                success_note="base64 已保存",
+            )
+            if path:
+                return path, note
         return "", "候选不可用"
 
     @staticmethod

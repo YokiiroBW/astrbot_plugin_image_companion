@@ -174,3 +174,22 @@ async def test_formal_image_task_reports_success_with_degraded_capability(tmp_pa
     assert result["status"] == "succeeded"
     assert result["backend_task_id"] == "actual-task"
     assert result["degraded_capabilities"] == ["prompt_rewrite:original"]
+
+
+@pytest.mark.asyncio
+async def test_formal_unified_task_preserves_backend_and_degraded_capabilities(tmp_path):
+    image = tmp_path / "output.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+    api = ImageCompanionExtensionAPI.__new__(ImageCompanionExtensionAPI)
+    api._reference_leases = {}
+    api.generate_for_companion = AsyncMock(return_value={
+        "image_path": str(image), "backend": "统一引擎/comfyui/default",
+        "metadata": {
+            "task_id": "unified-task",
+            "degraded_capabilities": ["prompt_rewrite:original", "reference:missing"],
+        },
+    })
+    result = await api.execute_task({"input": {}})
+    assert result["backend"] == "comfyui"
+    assert result["backend_task_id"] == "unified-task"
+    assert result["degraded_capabilities"] == ["prompt_rewrite:original", "reference:missing"]

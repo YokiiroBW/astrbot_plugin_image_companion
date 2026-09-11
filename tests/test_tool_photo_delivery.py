@@ -70,12 +70,51 @@ async def test_extracts_complete_paths_from_tool_prose(runtime, path):
 
 
 @pytest.mark.asyncio
+async def test_extracts_relative_paths_with_spaces_from_tool_prose(runtime):
+    candidates = []
+
+    async def resolve(value, **_):
+        candidates.append(value)
+        return ("/archive.png", "ok") if value == "outputs/final image.png" else ("", "missing")
+
+    runtime._resolve_custom_tool_image_candidate = resolve
+    result = await runtime._parse_custom_tool_photo_result(
+        "ComfyUI 输出位于 outputs/final image.png。",
+        session_key="test",
+    )
+    assert result[0] == "/archive.png"
+    assert "outputs/final image.png" in candidates
+
+
+@pytest.mark.asyncio
 async def test_image_file_uri_is_decoded_and_archived(runtime, tmp_path):
     source = tmp_path / "带空格 的图片.png"
     source.write_bytes(PNG)
     path, note = await runtime._resolve_custom_tool_image_candidate(source.as_uri(), session_key="qq:FriendMessage:user")
     assert Path(path).read_bytes() == PNG and "归档" in note
     assert path != str(source)
+
+
+@pytest.mark.asyncio
+async def test_small_data_uri_is_validated_and_archived(runtime):
+    encoded = base64.b64encode(PNG).decode("ascii")
+    path, note = await runtime._resolve_custom_tool_image_candidate(
+        f"data:image/png;base64,{encoded}",
+        session_key="test",
+    )
+    assert path and Path(path).read_bytes() == PNG
+    assert "base64" in note
+
+
+@pytest.mark.asyncio
+async def test_small_data_uri_is_extracted_from_tool_prose(runtime):
+    encoded = base64.b64encode(PNG).decode("ascii")
+    path, note = await runtime._parse_custom_tool_photo_result(
+        f"工具返回图片：data:image/png;base64,{encoded}。",
+        session_key="test",
+    )
+    assert path and Path(path).read_bytes() == PNG
+    assert "base64" in note
 
 
 @pytest.mark.asyncio

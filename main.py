@@ -249,11 +249,22 @@ class ImageCompanionExtensionAPI:
         outcome = await self.generate_for_companion(owner, request)
         request_id = uuid.uuid4().hex
         image_path = str(outcome.get("image_path") or "")
+        metadata = outcome.get("metadata") if isinstance(outcome, dict) else None
+        metadata = metadata if isinstance(metadata, dict) else {}
+        degraded_capabilities = [
+            str(value).strip()
+            for value in (metadata.get("degraded_capabilities") or [])
+            if str(value).strip()
+        ] if isinstance(metadata.get("degraded_capabilities"), (list, tuple, set)) else []
+        if metadata.get("rewrite_fallback") and "prompt_rewrite:original" not in degraded_capabilities:
+            degraded_capabilities.append("prompt_rewrite:original")
         if image_path and os.path.isfile(image_path):
             raw = Path(image_path).read_bytes()
             _suffix, media_type = self._image_content_type(raw)
             media_type = media_type or "image/jpeg"
-            return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "succeeded", "backend": "comfyui" if str(outcome.get("backend") or "").lower() == "comfyui" else "external", "backend_task_id": str((outcome.get("metadata") or {}).get("task_id") or request_id), "output": {"asset_id": "image_" + request_id[:32], "kind": "image", "media_type": media_type, "local_path": image_path, "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, "error": None, "degraded_capabilities": ["prompt_rewrite:original"] if (outcome.get("metadata") or {}).get("rewrite_fallback") else []}
+            backend_name = str(outcome.get("backend") or "").strip().lower()
+            backend = "comfyui" if backend_name == "comfyui" or backend_name.startswith("统一引擎/comfyui/") else "external"
+            return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "succeeded", "backend": backend, "backend_task_id": str(metadata.get("task_id") or request_id), "output": {"asset_id": "image_" + request_id[:32], "kind": "image", "media_type": media_type, "local_path": image_path, "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, "error": None, "degraded_capabilities": list(dict.fromkeys(degraded_capabilities))}
         error_code, error_stage = self._generation_failure_code(outcome)
         return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "failed", "backend": "", "backend_task_id": "", "output": None, "error": {"code": error_code, "stage": error_stage}, "degraded_capabilities": []}
 
